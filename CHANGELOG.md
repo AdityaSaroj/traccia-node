@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `llm.previous_interaction_id` captured for multi-turn calls; `llm.model` falls back to the response's `model` when the request omits it
 - Streaming (`stream: true`) calls: span is created and tagged `llm.streaming: true`, but usage/completion population is intentionally skipped since `create()` resolves with a `Stream` object before the model has produced output
 - Soft-fails (no crash) when `@google/genai` isn't installed
+- Redaction allowlist for `traccia.policy.*` span attributes (same pattern as `traccia.prompt.*`)
+- HTTP client skip for `@govern()` status/block calls on axios and fetch, matching the Python SDK
 
 ## [0.1.9] - 2026-08-14
 
