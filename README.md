@@ -114,7 +114,7 @@ console.log(result.url);
 
 - **Persist is on by default.** Set `persist: false` for a local-only loop (no experiment URL).
 - **Inline rows** work as `[{ input: { ... }, expected: "..." }]`. With persist on, Traccia still saves a full experiment (helper datasets named `sdk-eval/...` are hidden on **Evaluate → Datasets** unless you turn on **Show SDK-Created**).
-- **Builtins** run in-process: `exact_match`, `contains`, `json_valid`. Mix in platform scorers (LLM-as-judge, code) by name or UUID. Pass `providerKeys` for judges.
+- **Builtins** run in-process: `exact_match`, `contains`, `json_valid`. Mix in platform scorers (LLM-as-judge, Jev Decision, code) by name or UUID. Pass `providerKeys` for judges (`typesafe` for Jev). A Jev score keeps each question on the experiment.
 - **One throwing row does not abort the run.** That cell records `error`; other items still score. Configuration and API failures raise `EvaluateError`.
 - The task always receives the row's `input` object only. Wrapper fields are camelCase (`experimentId`, `persistError`); row payloads stay snake_case.
 
@@ -277,7 +277,7 @@ await stopTracing();
 | `prompt` | Optional prompt name for version ids and cell label (otherwise `Task`) |
 | `maxConcurrency` | Parallel workers (default 10) |
 | `persist` | Create an experiment (default `true`) |
-| `providerKeys` | BYO keys for platform LLM-as-judge |
+| `providerKeys` | BYO keys for platform LLM-as-judge, and `typesafe` for Jev Decision. A Jev score keeps each question, so the experiment shows one chip per question. |
 | `progress` | Print `N/M` to stderr (default `true`) |
 
 Returns `EvaluateResult` with `rows`, `aggregates`, `summary()`, `url`, `experimentId`, `datasetId`, `errors`, `persistError`. Empty data, bad config, and dataset/scorer API failures throw `EvaluateError`. Full reference: [Evaluate in the SDK](https://traccia.ai/docs/sdk/evaluate).

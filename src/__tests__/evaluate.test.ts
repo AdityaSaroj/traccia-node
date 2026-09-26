@@ -389,6 +389,72 @@ describe('evaluate scorer variants', () => {
     expect(mockEvalClient.scoreRemote).toHaveBeenCalled();
     const score = (result.rows[0].panels as any[])[0].scores[0];
     expect(score.passed).toBe(true);
+    expect(score.questions).toBeUndefined();
+    expect(score.unsure).toBeUndefined();
+  });
+
+  it('keeps Jev questions on the saved score and leaves other remote scorers unchanged', async () => {
+    mockEvalClient.fetchScorer.mockResolvedValue({
+      id: 'jev-1',
+      name: 'Answer Quality',
+      type: 'jev',
+    });
+    mockEvalClient.scoreRemote.mockResolvedValue({
+      scorer_id: 'jev-1',
+      scorer_name: 'Answer Quality',
+      type: 'jev',
+      passed: true,
+      score: 0.9,
+      model: 'jev-1.13.0',
+      questions: [{ key: 'grounded', label: 'Grounded', passed: true, score: 0.93 }],
+      unsure: false,
+    });
+
+    const jev = await evaluate({
+      name: 'jev-score',
+      data: [{ input: { q: 'hi' } }],
+      task: () => 'x',
+      scorers: ['Answer Quality'],
+      persist: false,
+      progress: false,
+    });
+    const jevScore = (jev.rows[0].panels as any[])[0].scores[0];
+    expect(jevScore.questions).toEqual([
+      { key: 'grounded', label: 'Grounded', passed: true, score: 0.93 },
+    ]);
+    expect(jevScore.unsure).toBe(false);
+    expect(jevScore.passed).toBe(true);
+
+    mockEvalClient.fetchScorer.mockResolvedValue({
+      id: 'judge-1',
+      name: 'Helpfulness',
+      type: 'llm_judge',
+    });
+    mockEvalClient.scoreRemote.mockResolvedValue({
+      scorer_id: 'judge-1',
+      scorer_name: 'Helpfulness',
+      type: 'llm_judge',
+      passed: true,
+      score: 1,
+      reason: 'The reply answers the question.',
+      model: 'gpt-4o-mini',
+    });
+
+    const judge = await evaluate({
+      name: 'judge-score',
+      data: [{ input: { q: 'hi' } }],
+      task: () => 'x',
+      scorers: ['Helpfulness'],
+      persist: false,
+      progress: false,
+    });
+    const judgeScore = (judge.rows[0].panels as any[])[0].scores[0];
+    expect(judgeScore.passed).toBe(true);
+    expect(judgeScore.score).toBe(1);
+    expect(judgeScore.reason).toBe('The reply answers the question.');
+    expect(judgeScore.model).toBe('gpt-4o-mini');
+    expect(judgeScore.questions).toBeUndefined();
+    expect(judgeScore.unsure).toBeUndefined();
   });
 
   it('resolves a non-builtin string scorer whose platform type IS a builtin, running it locally', async () => {
