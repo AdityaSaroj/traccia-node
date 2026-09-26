@@ -1,6 +1,6 @@
 {
   "name": "@traccia/sdk",
-  "version": "0.1.15",
+  "version": "0.1.16",
   "description": "Tracing SDK for agent applications",
   "main": "dist/index.js",
   "bin": {
