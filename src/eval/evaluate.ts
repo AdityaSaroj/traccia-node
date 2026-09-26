@@ -380,6 +380,8 @@ export async function evaluate(opts: EvaluateOptions): Promise<EvaluateResult> {
       latency_ms: remote.latency_ms,
       cost_usd: remote.cost_usd,
       usage: remote.usage && typeof remote.usage === 'object' ? remote.usage : undefined,
+      ...(Array.isArray(remote.questions) ? { questions: remote.questions } : {}),
+      ...("unsure" in remote ? { unsure: remote.unsure } : {}),
     };
   };
 
