@@ -20,11 +20,31 @@ jobs:
       id-token: write  # Required for npm provenance
     steps:
       - uses: actions/checkout@v4
-      
+        with:
+          fetch-depth: 0
+
       - uses: actions/setup-node@v4
         with:
           node-version: '20.x'
           registry-url: 'https://registry.npmjs.org'
+
+      # Fail before anything is tagged if the token is expired or revoked.
+      - name: Verify npm auth
+        run: npm whoami
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Check version is new
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if npm view "@traccia/sdk@${{ inputs.version }}" version >/dev/null 2>&1; then
+            echo "::error::@traccia/sdk@${{ inputs.version }} is already on npm"
+            exit 1
+          fi
+          if git rev-parse "v${{ inputs.version }}" >/dev/null 2>&1; then
+            echo "::error::Tag v${{ inputs.version }} already exists. Pick the next version"
+            exit 1
+          fi
 
       - name: Git Config
         if: github.event_name == 'workflow_dispatch'
@@ -32,19 +52,15 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Update Version & Tag
+      # A re-run checks out the original commit, so move to the branch tip before bumping.
+      - name: Sync to branch tip
+        if: github.event_name == 'workflow_dispatch'
+        run: git pull --ff-only origin "${GITHUB_REF_NAME}"
+
+      - name: Bump version (local only)
         if: github.event_name == 'workflow_dispatch'
         run: |
           npm version ${{ inputs.version }} -m "chore: release v%s"
-          git push
-          git push --tags
-
-      - name: Create GitHub Release
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create v${{ inputs.version }} --generate-notes
 
       - name: Install Dependencies
         run: npm ci
@@ -59,3 +75,16 @@ jobs:
         run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # Push and release only after npm has the package, so a tag always means it shipped.
+      - name: Push version commit and tag
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          git push origin "v${{ inputs.version }}"
+
+      - name: Create GitHub Release
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create v${{ inputs.version }} --generate-notes
