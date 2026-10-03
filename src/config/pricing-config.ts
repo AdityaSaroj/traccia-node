@@ -7,11 +7,20 @@ import * as path from 'path';
 import * as os from 'os';
 import axios from 'axios';
 
+export interface PricingRates {
+  inputCost: number;
+  outputCost: number;
+  cacheReadCost?: number;
+  cacheWriteCost?: number;
+  /** Platform snapshot aliases, per 1K tokens. */
+  prompt?: number;
+  completion?: number;
+  cached_prompt?: number;
+  cache_write?: number;
+}
+
 export interface PricingTable {
-  [model: string]: {
-    inputCost: number;
-    outputCost: number;
-  };
+  [model: string]: PricingRates;
 }
 
 export type PricingSource = 'default' | 'env' | 'override' | 'bundled' | 'local_cache';
@@ -100,9 +109,14 @@ export async function fetchUpstreamPricing(): Promise<{ models: PricingTable; ge
         const input_cpt = (entry as Record<string, unknown>).input_cost_per_token;
         const output_cpt = (entry as Record<string, unknown>).output_cost_per_token;
         if (input_cpt !== undefined || output_cpt !== undefined) {
+          const raw = entry as Record<string, unknown>;
+          const cacheRead = raw.cache_read_input_token_cost;
+          const cacheWrite = raw.cache_creation_input_token_cost;
           models[modelId] = {
             inputCost: input_cpt ? Number((input_cpt as number) * 1000) : 0,
             outputCost: output_cpt ? Number((output_cpt as number) * 1000) : 0,
+            ...(typeof cacheRead === "number" ? { cacheReadCost: cacheRead * 1000 } : {}),
+            ...(typeof cacheWrite === "number" ? { cacheWriteCost: cacheWrite * 1000 } : {}),
           };
         }
       }
