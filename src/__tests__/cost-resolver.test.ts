@@ -34,6 +34,32 @@ describe('CostResolver', () => {
     expect(cost).toBeUndefined();
   });
 
+  it('prices cache read and write separately from uncached input', () => {
+    resolver.update({
+      'grok-4.6': { inputCost: 0.002, outputCost: 0.01, cacheReadCost: 0.0002, cacheWriteCost: 0.0025 },
+    });
+    const detailed = resolver.computeDetailed('grok-4.6', 100, 20, 800, 100);
+    expect(detailed?.cacheFallback).toBe(false);
+    expect(detailed?.cost).toBeCloseTo(0.0002 + 0.0002 + 0.00016 + 0.00025);
+  });
+
+  it('falls back to the input rate when cache prices are missing', () => {
+    const detailed = resolver.computeDetailed('gpt-4', 0, 0, 1000, 0);
+    expect(detailed?.cacheFallback).toBe(true);
+    expect(detailed?.cost).toBeCloseTo(0.03);
+  });
+
+  it('matches grok-4.7 to xai/grok-4.7 and not grok-4', () => {
+    resolver.update({
+      'xai/grok-4.7': { inputCost: 0.002, outputCost: 0.01, cacheReadCost: 0.0002 },
+      'openrouter/x-ai/grok-4.7': { inputCost: 9, outputCost: 9 },
+      'grok-4': { inputCost: 0.001, outputCost: 0.001 },
+    });
+    expect(resolver.matchPricingModelKey('grok-4.7')).toBe('xai/grok-4.7');
+    const detailed = resolver.computeDetailed('grok-4.7', 1000, 0);
+    expect(detailed?.cost).toBeCloseTo(0.002);
+  });
+
   it('should dynamically update pricing tables', () => {
     resolver.update(
       { 'gpt-4': { inputCost: 0.01, outputCost: 0.02 } },

@@ -124,15 +124,21 @@ export class CostAnnotatingProcessor implements ISpanProcessor {
         'llm.usage.output_tokens',
         'output_tokens',
       );
+      const cacheReadTokens = readTokenCount(attrs, 'llm.usage.cache_read_tokens', 'llm.usage.cache_read_tokens') ?? 0;
+      const cacheWriteTokens = readTokenCount(attrs, 'llm.usage.cache_write_tokens', 'llm.usage.cache_write_tokens') ?? 0;
 
       if (!model || promptTokens == null || completionTokens == null) {
         return;
       }
 
       const resolver = getResolver();
-      const cost = resolver.compute(model, promptTokens, completionTokens);
-      if (cost == null) {
+      const detailed = resolver.computeDetailed(model, promptTokens, completionTokens, cacheReadTokens, cacheWriteTokens);
+      if (detailed == null) {
         return;
+      }
+      const cost = detailed.cost;
+      if (detailed.cacheFallback) {
+        span.setAttribute('llm.pricing.cache_fallback', true);
       }
 
       checkAndLogStaleness(this.pricingGeneratedAt, snapshotAgeDays(this.pricingGeneratedAt));
