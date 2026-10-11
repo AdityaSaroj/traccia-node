@@ -21,7 +21,8 @@ describe('OpenAI Instrumentation', () => {
         } as unknown as ISpan;
 
         mockTracer = {
-            startActiveSpan: jest.fn((name, fn) => fn(mockSpan))
+            startActiveSpan: jest.fn((name, fn) => fn(mockSpan)),
+            startSpan: jest.fn(() => mockSpan),
         };
 
         (getTracer as jest.Mock).mockReturnValue(mockTracer);
@@ -36,15 +37,21 @@ describe('OpenAI Instrumentation', () => {
         // fresh module instance (fresh `_patched = false`) so every branch is
         // actually exercised. See src/instrumentation/gemini.ts's equivalent fix
         // for the same underlying bug.
-        it('should patch when openai is available (legacy SDK with chat on prototype)', () => {
+        it('should wrap Chat.Completions.prototype.create when openai is available', () => {
             jest.isolateModules(() => {
-                jest.doMock('openai', () => ({
-                    OpenAI: { prototype: { chat: {} } },
-                }), { virtual: true });
+                jest.doMock('openai', () => {
+                    class Completions { create() { return Promise.resolve({}); } }
+                    return { OpenAI: { Chat: { Completions } } };
+                }, { virtual: true });
 
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
                 const fresh = require('../instrumentation/openai');
+                // eslint-disable-next-line @typescript-eslint/no-require-imports
+                const proto = require('openai').OpenAI.Chat.Completions.prototype;
+                const original = proto.create;
                 expect(fresh.patchOpenAI()).toBe(true);
+                expect(proto.create).not.toBe(original);
+                expect(proto.create._agentTracePatched).toBe(true);
 
                 jest.dontMock('openai');
             });
@@ -79,9 +86,10 @@ describe('OpenAI Instrumentation', () => {
 
         it('should return true on subsequent calls without re-checking the module', () => {
             jest.isolateModules(() => {
-                jest.doMock('openai', () => ({
-                    OpenAI: { prototype: { chat: {} } },
-                }), { virtual: true });
+                jest.doMock('openai', () => {
+                    class Completions { create() { return Promise.resolve({}); } }
+                    return { OpenAI: { Chat: { Completions } } };
+                }, { virtual: true });
 
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
                 const fresh = require('../instrumentation/openai');
@@ -111,7 +119,7 @@ describe('OpenAI Instrumentation', () => {
             });
         });
 
-        it('should patch the "modern SDK" shape where chat is not present on the prototype', () => {
+        it('should return false when Chat.Completions has no create to wrap', () => {
             jest.isolateModules(() => {
                 jest.doMock('openai', () => ({
                     OpenAI: { prototype: {} },
@@ -119,7 +127,7 @@ describe('OpenAI Instrumentation', () => {
 
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
                 const fresh = require('../instrumentation/openai');
-                expect(fresh.patchOpenAI()).toBe(true);
+                expect(fresh.patchOpenAI()).toBe(false);
 
                 jest.dontMock('openai');
             });
@@ -127,13 +135,21 @@ describe('OpenAI Instrumentation', () => {
     });
 
     describe('patchOpenAIResponses', () => {
-        it('should return true when openai is available', () => {
+        it('should wrap Responses.prototype.create when openai is available', () => {
             jest.isolateModules(() => {
-                jest.doMock('openai', () => ({}), { virtual: true });
+                jest.doMock('openai', () => {
+                    class Responses { create() { return Promise.resolve({}); } }
+                    return { OpenAI: { Responses } };
+                }, { virtual: true });
 
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
                 const fresh = require('../instrumentation/openai');
+                // eslint-disable-next-line @typescript-eslint/no-require-imports
+                const proto = require('openai').OpenAI.Responses.prototype;
+                const original = proto.create;
                 expect(fresh.patchOpenAIResponses()).toBe(true);
+                expect(proto.create).not.toBe(original);
+                expect(proto.create._agentTracePatched).toBe(true);
 
                 jest.dontMock('openai');
             });
@@ -168,7 +184,10 @@ describe('OpenAI Instrumentation', () => {
 
         it('should return true on subsequent calls without re-checking the module', () => {
             jest.isolateModules(() => {
-                jest.doMock('openai', () => ({}), { virtual: true });
+                jest.doMock('openai', () => {
+                    class Responses { create() { return Promise.resolve({}); } }
+                    return { OpenAI: { Responses } };
+                }, { virtual: true });
 
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
                 const fresh = require('../instrumentation/openai');
@@ -204,10 +223,7 @@ describe('OpenAI Instrumentation', () => {
             });
 
             expect(getTracer).toHaveBeenCalledWith('openai');
-            expect(mockTracer.startActiveSpan).toHaveBeenCalledWith(
-                'llm.openai.chat.completions',
-                expect.any(Function),
-            );
+            expect(mockTracer.startSpan).toHaveBeenCalledWith('llm.openai.chat.completions');
             
             expect(mockSpan.setAttribute).toHaveBeenCalledWith('llm.vendor', 'openai');
             expect(mockSpan.setAttribute).toHaveBeenCalledWith('llm.model', 'gpt-4');
@@ -287,7 +303,7 @@ describe('OpenAI Instrumentation', () => {
                 input: 'Hello response API'
             });
 
-            expect(mockTracer.startActiveSpan).toHaveBeenCalledWith('llm.openai.responses', expect.any(Function));
+            expect(mockTracer.startSpan).toHaveBeenCalledWith('llm.openai.responses');
             expect(mockSpan.setAttribute).toHaveBeenCalledWith('llm.vendor', 'openai');
             expect(mockSpan.setAttribute).toHaveBeenCalledWith('llm.api', 'responses');
             expect(mockSpan.setAttribute).toHaveBeenCalledWith('llm.model', 'o1-preview');

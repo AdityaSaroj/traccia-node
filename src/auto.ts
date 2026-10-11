@@ -41,6 +41,8 @@ import { configureGovernance } from './governance/config';
 import { configurePrompts } from './prompts';
 import { patchGemini } from './instrumentation/gemini';
 import { patchAxios } from './instrumentation/axios';
+import { patchOpenAI, patchOpenAIResponses } from './instrumentation/openai';
+import { patchAnthropic } from './instrumentation/anthropic';
 
 let globalProvider: TracerProvider | null = null;
 let started = false;
@@ -302,6 +304,13 @@ export async function init(config: SDKConfig = {}): Promise<TracerProvider> {
       patchAxios();
     } catch {
       /* optional peer */
+    }
+    for (const patch of [patchOpenAI, patchOpenAIResponses, patchAnthropic]) {
+      try {
+        patch();
+      } catch {
+        /* optional peer */
+      }
     }
   }
 

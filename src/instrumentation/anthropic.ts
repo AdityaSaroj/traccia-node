@@ -5,9 +5,8 @@
  * - messages.create()
  */
 
-import { getTracer } from '../auto';
-import { SpanStatus, ISpan } from '../types';
-import { enforceLlmCall, finishLlmCall } from '../governance/pep';
+import { ISpan } from '../types';
+import { tracedProviderCall } from './llm-call';
 
 let _patched = false;
 
@@ -29,10 +28,26 @@ function safeGet(obj: unknown, path: string, defaultValue: unknown = undefined):
     return current ?? defaultValue;
 }
 
+type PatchedFn = ((...args: unknown[]) => unknown) & { _agentTracePatched?: boolean };
+
+type AnthropicClass = { Messages?: { prototype?: { create?: PatchedFn } } };
+type AnthropicModule = AnthropicClass & { Anthropic?: AnthropicClass; default?: AnthropicClass };
+
+function requireAnthropic(): AnthropicModule | null {
+    try {
+        // Dynamic import to avoid hard dependency
+        // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
+        return require('@anthropic-ai/sdk') as AnthropicModule | null;
+    } catch {
+        return null;
+    }
+}
+
 /**
- * Patch Anthropic messages.create for tracing.
+ * Patch Anthropic `client.messages.create` for tracing by wrapping the shared
+ * Messages prototype, so every client instance is covered.
  *
- * @returns true if patched successfully, false otherwise
+ * @returns true if create was wrapped, false otherwise
  */
 export function patchAnthropic(): boolean {
     if (_patched) {
@@ -40,11 +55,23 @@ export function patchAnthropic(): boolean {
     }
 
     try {
-        // Dynamic import to avoid hard dependency
-        // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
-        const anthropic = require('@anthropic-ai/sdk');
+        const anthropic = requireAnthropic();
         if (!anthropic) {
             return false;
+        }
+
+        const Anthropic: AnthropicClass = anthropic.Anthropic || anthropic.default || anthropic;
+        const proto = Anthropic.Messages?.prototype;
+        if (!proto || typeof proto.create !== 'function') {
+            return false;
+        }
+        if (!proto.create._agentTracePatched) {
+            const wrapped = wrapAnthropicCreate(
+                proto.create as (...args: unknown[]) => Promise<unknown>,
+                null
+            ) as PatchedFn;
+            wrapped._agentTracePatched = true;
+            proto.create = wrapped;
         }
 
         _patched = true;
@@ -55,15 +82,68 @@ export function patchAnthropic(): boolean {
 }
 
 /**
- * Wrap an Anthropic messages.create call.
+ * Populate a span from a completed Anthropic message.
+ */
+function populateAnthropicSpan(span: ISpan, response: unknown): void {
+    // Extract usage from response
+    const usage = safeGet(response, 'usage') as Record<string, number> | undefined;
+    if (usage) {
+        span.setAttribute('llm.usage.source', 'provider_usage');
+
+        if (usage.input_tokens !== undefined) {
+            span.setAttribute('llm.usage.input_tokens', usage.input_tokens);
+            // Provide OpenAI-style aliases for consistency
+            span.setAttribute('llm.usage.prompt_tokens', usage.input_tokens);
+            span.setAttribute('llm.usage.prompt_source', 'provider_usage');
+        }
+
+        if (usage.output_tokens !== undefined) {
+            span.setAttribute('llm.usage.output_tokens', usage.output_tokens);
+            // Provide OpenAI-style aliases for consistency
+            span.setAttribute('llm.usage.completion_tokens', usage.output_tokens);
+            span.setAttribute('llm.usage.completion_source', 'provider_usage');
+        }
+    }
+
+    // Extract stop reason
+    const stopReason = safeGet(response, 'stop_reason');
+    if (stopReason) {
+        span.setAttribute('llm.stop_reason', String(stopReason));
+    }
+
+    // Extract response content
+    const content = safeGet(response, 'content') as unknown[];
+    if (Array.isArray(content) && content.length > 0) {
+        const textBlock = content.find(
+            (block: unknown) =>
+                typeof block === 'object' &&
+                block !== null &&
+                (block as Record<string, unknown>).type === 'text'
+        ) as Record<string, unknown> | undefined;
+
+        if (textBlock?.text) {
+            span.setAttribute('llm.response', String(textBlock.text).slice(0, 1000));
+        }
+    }
+}
+
+interface AnthropicStreamState {
+    model?: string;
+    text: string;
+    stopReason?: string;
+    inputTokens?: number;
+    outputTokens?: number;
+}
+
+/**
+ * Wrap an Anthropic messages.create call (non-streaming and `stream: true`).
  */
 export function wrapAnthropicCreate<T>(
     createFn: (...args: unknown[]) => Promise<T>,
     instance: unknown
 ): (...args: unknown[]) => Promise<T> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return async function wrappedCreate(this: any, ...args: unknown[]): Promise<T> {
-        const tracer = getTracer('anthropic');
+    return function wrappedCreate(this: any, ...args: unknown[]): Promise<T> {
         const kwargs = (args[0] || {}) as Record<string, unknown>;
 
         const model = kwargs.model as string | undefined;
@@ -76,6 +156,9 @@ export function wrapAnthropicCreate<T>(
 
         if (model) {
             attributes['llm.model'] = model;
+        }
+        if (kwargs.stream === true) {
+            attributes['llm.streaming'] = true;
         }
 
         // Extract prompt from messages
@@ -106,70 +189,51 @@ export function wrapAnthropicCreate<T>(
             }
         }
 
-        return tracer.startActiveSpan('llm.anthropic.messages', async (span: ISpan) => {
-            for (const [key, value] of Object.entries(attributes)) {
-                span.setAttribute(key, value);
-            }
-
-            let decision: Record<string, unknown> | undefined;
-            try {
-                decision = await enforceLlmCall(kwargs);
-                const response = await createFn.apply(instance || this, args);
-
-                // Extract usage from response
-                const usage = safeGet(response, 'usage') as Record<string, number> | undefined;
-                if (usage) {
-                    span.setAttribute('llm.usage.source', 'provider_usage');
-
-                    if (usage.input_tokens !== undefined) {
-                        span.setAttribute('llm.usage.input_tokens', usage.input_tokens);
-                        // Provide OpenAI-style aliases for consistency
-                        span.setAttribute('llm.usage.prompt_tokens', usage.input_tokens);
-                        span.setAttribute('llm.usage.prompt_source', 'provider_usage');
+        return tracedProviderCall<AnthropicStreamState>(createFn, instance || this, args, {
+            tracerName: 'anthropic',
+            spanName: 'llm.anthropic.messages',
+            attributes,
+            onResponse: populateAnthropicSpan,
+            initStreamState: () => ({ text: '' }),
+            onStreamEvent: (_span, event, state) => {
+                switch (safeGet(event, 'type')) {
+                    case 'message_start':
+                        state.model = safeGet(event, 'message.model') as string | undefined;
+                        state.inputTokens = safeGet(event, 'message.usage.input_tokens') as number | undefined;
+                        break;
+                    case 'content_block_delta': {
+                        const text = safeGet(event, 'delta.text');
+                        if (typeof text === 'string') {
+                            state.text += text;
+                        }
+                        break;
                     }
-
-                    if (usage.output_tokens !== undefined) {
-                        span.setAttribute('llm.usage.output_tokens', usage.output_tokens);
-                        // Provide OpenAI-style aliases for consistency
-                        span.setAttribute('llm.usage.completion_tokens', usage.output_tokens);
-                        span.setAttribute('llm.usage.completion_source', 'provider_usage');
-                    }
-                }
-
-                // Extract stop reason
-                const stopReason = safeGet(response, 'stop_reason');
-                if (stopReason) {
-                    span.setAttribute('llm.stop_reason', String(stopReason));
-                }
-
-                // Extract response content
-                const content = safeGet(response, 'content') as unknown[];
-                if (Array.isArray(content) && content.length > 0) {
-                    const textBlock = content.find(
-                        (block: unknown) =>
-                            typeof block === 'object' &&
-                            block !== null &&
-                            (block as Record<string, unknown>).type === 'text'
-                    ) as Record<string, unknown> | undefined;
-
-                    if (textBlock?.text) {
-                        span.setAttribute('llm.response', String(textBlock.text).slice(0, 1000));
+                    case 'message_delta': {
+                        const stopReason = safeGet(event, 'delta.stop_reason');
+                        if (stopReason) {
+                            state.stopReason = String(stopReason);
+                        }
+                        const outputTokens = safeGet(event, 'usage.output_tokens');
+                        if (typeof outputTokens === 'number') {
+                            state.outputTokens = outputTokens;
+                        }
+                        break;
                     }
                 }
-
-                await finishLlmCall(decision);
-                return response;
-            } catch (error) {
-                await finishLlmCall(decision, { release: true }).catch(() => undefined);
-                if (error instanceof Error) {
-                    span.recordException(error);
-                    span.status = SpanStatus.ERROR;
-                    span.statusDescription = error.message;
+            },
+            onStreamEnd: (span, state) => {
+                if (state.model && !span.attributes['llm.model']) {
+                    span.setAttribute('llm.model', state.model);
                 }
-                throw error;
-            } finally {
-                span.end();
-            }
-        });
+                populateAnthropicSpan(span, {
+                    usage:
+                        state.inputTokens !== undefined || state.outputTokens !== undefined
+                            ? { input_tokens: state.inputTokens, output_tokens: state.outputTokens }
+                            : undefined,
+                    stop_reason: state.stopReason,
+                    content: [{ type: 'text', text: state.text }],
+                });
+            },
+        }) as unknown as Promise<T>;
     };
 }

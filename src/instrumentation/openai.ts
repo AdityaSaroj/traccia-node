@@ -6,9 +6,8 @@
  * - responses.create() (Responses API)
  */
 
-import { getTracer } from '../auto';
-import { SpanStatus, ISpan } from '../types';
-import { enforceLlmCall, finishLlmCall } from '../governance/pep';
+import { ISpan } from '../types';
+import { tracedProviderCall } from './llm-call';
 
 let _patched = false;
 let _responsesPatched = false;
@@ -75,10 +74,49 @@ function extractPromptText(messages: unknown[]): string {
     return '';
 }
 
+type PatchedFn = ((...args: unknown[]) => unknown) & { _agentTracePatched?: boolean };
+type CreateWrapper = (
+    createFn: (...args: unknown[]) => Promise<unknown>,
+    instance: unknown
+) => (...args: unknown[]) => Promise<unknown>;
+
+type ResourceClass = { prototype?: { create?: PatchedFn } };
+type OpenAIClass = { Chat?: { Completions?: ResourceClass }; Responses?: ResourceClass };
+type OpenAIModule = OpenAIClass & { OpenAI?: OpenAIClass; default?: OpenAIClass };
+
+function requireOpenAI(): OpenAIModule | null {
+    try {
+        // Dynamic import to avoid hard dependency
+        // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
+        return require('openai') as OpenAIModule | null;
+    } catch {
+        return null;
+    }
+}
+
 /**
- * Patch OpenAI chat completions for tracing.
+ * Replace `proto.create` with a traced wrapper. Every client instance shares the
+ * resource prototype, so this covers clients created before and after patching.
  *
- * @returns true if patched successfully, false otherwise
+ * @returns true if `create` is now wrapped, false if the prototype has no create
+ */
+function patchPrototypeCreate(proto: { create?: PatchedFn } | undefined, wrap: CreateWrapper): boolean {
+    if (!proto || typeof proto.create !== 'function') {
+        return false;
+    }
+    if (proto.create._agentTracePatched) {
+        return true;
+    }
+    const wrapped = wrap(proto.create as (...args: unknown[]) => Promise<unknown>, null) as PatchedFn;
+    wrapped._agentTracePatched = true;
+    proto.create = wrapped;
+    return true;
+}
+
+/**
+ * Patch OpenAI chat completions (`client.chat.completions.create`) for tracing.
+ *
+ * @returns true if create was wrapped, false otherwise
  */
 export function patchOpenAI(): boolean {
     if (_patched) {
@@ -86,30 +124,14 @@ export function patchOpenAI(): boolean {
     }
 
     try {
-        // Dynamic import to avoid hard dependency
-        // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
-        const openai = require('openai');
+        const openai = requireOpenAI();
         if (!openai) {
             return false;
         }
 
-        const OpenAI = openai.default || openai.OpenAI || openai;
-        if (!OpenAI) {
+        const OpenAI: OpenAIClass = openai.OpenAI || openai.default || openai;
+        if (!patchPrototypeCreate(OpenAI.Chat?.Completions?.prototype, wrapOpenAICreate as CreateWrapper)) {
             return false;
-        }
-
-        // Try to patch the prototype's chat.completions.create
-        const prototype = OpenAI.prototype;
-        if (!prototype) {
-            return false;
-        }
-
-        // Store original create method reference
-        const originalChat = prototype.chat;
-        if (!originalChat) {
-            // Modern OpenAI SDK - patch class instance instead
-            _patched = true;
-            return true;
         }
 
         _patched = true;
@@ -120,15 +142,64 @@ export function patchOpenAI(): boolean {
 }
 
 /**
- * Wrap an OpenAI chat completions create call.
+ * Populate a span from a completed chat completion.
+ */
+function populateChatSpan(span: ISpan, response: unknown): void {
+    const usage = safeGet(response, 'usage') as Record<string, number> | undefined;
+    if (usage) {
+        span.setAttribute('llm.usage.source', 'provider_usage');
+        if (usage.prompt_tokens !== undefined) {
+            span.setAttribute('llm.usage.prompt_tokens', usage.prompt_tokens);
+            span.setAttribute('llm.usage.input_tokens', usage.prompt_tokens);
+            span.setAttribute('llm.usage.prompt_source', 'provider_usage');
+        }
+        if (usage.completion_tokens !== undefined) {
+            span.setAttribute('llm.usage.completion_tokens', usage.completion_tokens);
+            span.setAttribute('llm.usage.output_tokens', usage.completion_tokens);
+            span.setAttribute('llm.usage.completion_source', 'provider_usage');
+        }
+        if (usage.total_tokens !== undefined) {
+            span.setAttribute('llm.usage.total_tokens', usage.total_tokens);
+        }
+    }
+
+    const respModel = safeGet(response, 'model') as string | undefined;
+    if (respModel && !span.attributes['llm.model']) {
+        span.setAttribute('llm.model', respModel);
+    }
+
+    // Extract response content
+    const choices = safeGet(response, 'choices') as unknown[];
+    if (Array.isArray(choices) && choices.length > 0) {
+        const firstChoice = choices[0] as Record<string, unknown>;
+        const message = firstChoice?.message as Record<string, unknown>;
+        if (message?.content) {
+            const content = String(message.content).slice(0, 1000);
+            span.setAttribute('llm.completion', content);
+            span.setAttribute('llm.response', content);
+        }
+        if (firstChoice?.finish_reason) {
+            span.setAttribute('llm.finish_reason', String(firstChoice.finish_reason));
+        }
+    }
+}
+
+interface ChatStreamState {
+    model?: string;
+    content: string;
+    finishReason?: string;
+    usage?: unknown;
+}
+
+/**
+ * Wrap an OpenAI chat completions create call (non-streaming and `stream: true`).
  */
 export function wrapOpenAICreate<T>(
     createFn: (...args: unknown[]) => Promise<T>,
     instance: unknown
 ): (...args: unknown[]) => Promise<T> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return async function wrappedCreate(this: any, ...args: unknown[]): Promise<T> {
-        const tracer = getTracer('openai');
+    return function wrappedCreate(this: any, ...args: unknown[]): Promise<T> {
         const kwargs = (args[0] || {}) as Record<string, unknown>;
 
         const model = kwargs.model as string | undefined;
@@ -143,6 +214,9 @@ export function wrapOpenAICreate<T>(
         if (model) {
             attributes['llm.model'] = model;
         }
+        if (kwargs.stream === true) {
+            attributes['llm.streaming'] = true;
+        }
         if (promptText) {
             attributes['llm.prompt'] = promptText;
         }
@@ -152,67 +226,36 @@ export function wrapOpenAICreate<T>(
             attributes['llm.messages'] = serialized;
         }
 
-        return tracer.startActiveSpan('llm.openai.chat.completions', async (span: ISpan) => {
-            for (const [key, value] of Object.entries(attributes)) {
-                span.setAttribute(key, value);
-            }
-
-            let decision: Record<string, unknown> | undefined;
-            try {
-                decision = await enforceLlmCall(kwargs);
-                const response = await createFn.apply(instance || this, args);
-                const usage = safeGet(response, 'usage') as Record<string, number> | undefined;
+        return tracedProviderCall<ChatStreamState>(createFn, instance || this, args, {
+            tracerName: 'openai',
+            spanName: 'llm.openai.chat.completions',
+            attributes,
+            onResponse: populateChatSpan,
+            initStreamState: () => ({ content: '' }),
+            onStreamEvent: (_span, chunk, state) => {
+                state.model ??= safeGet(chunk, 'model') as string | undefined;
+                const choice = (safeGet(chunk, 'choices') as unknown[] | undefined)?.[0];
+                const delta = safeGet(choice, 'delta.content');
+                if (typeof delta === 'string') {
+                    state.content += delta;
+                }
+                const finishReason = safeGet(choice, 'finish_reason');
+                if (finishReason) {
+                    state.finishReason = String(finishReason);
+                }
+                // Only present when the caller sets stream_options.include_usage
+                const usage = safeGet(chunk, 'usage');
                 if (usage) {
-                    span.setAttribute('llm.usage.source', 'provider_usage');
-                    if (usage.prompt_tokens !== undefined) {
-                        span.setAttribute('llm.usage.prompt_tokens', usage.prompt_tokens);
-                        span.setAttribute('llm.usage.input_tokens', usage.prompt_tokens);
-                        span.setAttribute('llm.usage.prompt_source', 'provider_usage');
-                    }
-                    if (usage.completion_tokens !== undefined) {
-                        span.setAttribute('llm.usage.completion_tokens', usage.completion_tokens);
-                        span.setAttribute('llm.usage.output_tokens', usage.completion_tokens);
-                        span.setAttribute('llm.usage.completion_source', 'provider_usage');
-                    }
-                    if (usage.total_tokens !== undefined) {
-                        span.setAttribute('llm.usage.total_tokens', usage.total_tokens);
-                    }
+                    state.usage = usage;
                 }
-
-                const respModel = safeGet(response, 'model') as string | undefined;
-                if (respModel && !span.attributes['llm.model']) {
-                    span.setAttribute('llm.model', respModel);
-                }
-
-                // Extract response content
-                const choices = safeGet(response, 'choices') as unknown[];
-                if (Array.isArray(choices) && choices.length > 0) {
-                    const firstChoice = choices[0] as Record<string, unknown>;
-                    const message = firstChoice?.message as Record<string, unknown>;
-                    if (message?.content) {
-                        const content = String(message.content).slice(0, 1000);
-                        span.setAttribute('llm.completion', content);
-                        span.setAttribute('llm.response', content);
-                    }
-                    if (firstChoice?.finish_reason) {
-                        span.setAttribute('llm.finish_reason', String(firstChoice.finish_reason));
-                    }
-                }
-
-                await finishLlmCall(decision);
-                return response;
-            } catch (error) {
-                await finishLlmCall(decision, { release: true }).catch(() => undefined);
-                if (error instanceof Error) {
-                    span.recordException(error);
-                    span.status = SpanStatus.ERROR;
-                    span.statusDescription = error.message;
-                }
-                throw error;
-            } finally {
-                span.end();
-            }
-        });
+            },
+            onStreamEnd: (span, state) =>
+                populateChatSpan(span, {
+                    model: state.model,
+                    usage: state.usage,
+                    choices: [{ message: { content: state.content }, finish_reason: state.finishReason }],
+                }),
+        }) as unknown as Promise<T>;
     };
 }
 
@@ -227,10 +270,13 @@ export function patchOpenAIResponses(): boolean {
     }
 
     try {
-        // Dynamic import to avoid hard dependency
-        // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
-        const openai = require('openai');
+        const openai = requireOpenAI();
         if (!openai) {
+            return false;
+        }
+
+        const OpenAI: OpenAIClass = openai.OpenAI || openai.default || openai;
+        if (!patchPrototypeCreate(OpenAI.Responses?.prototype, wrapOpenAIResponsesCreate as CreateWrapper)) {
             return false;
         }
 
@@ -242,15 +288,73 @@ export function patchOpenAIResponses(): boolean {
 }
 
 /**
- * Wrap an OpenAI responses.create call.
+ * Populate a span from a completed Responses API response.
+ */
+function populateResponsesSpan(span: ISpan, response: unknown): void {
+    // Extract output from response
+    const output = safeGet(response, 'output');
+    if (Array.isArray(output) && output.length > 0) {
+        const textItems = output.filter(
+            (item: unknown) =>
+                typeof item === 'object' &&
+                (item as Record<string, unknown>).type === 'text'
+        );
+        if (textItems.length > 0) {
+            const text = (textItems[0] as Record<string, unknown>).text;
+            if (typeof text === 'string') {
+                span.setAttribute('llm.completion', text.slice(0, 1000));
+                span.setAttribute('llm.response', text.slice(0, 1000));
+            }
+        }
+    }
+
+    const respModel = safeGet(response, 'model') as string | undefined;
+    if (respModel && !span.attributes['llm.model']) {
+        span.setAttribute('llm.model', respModel);
+    }
+
+    const status = safeGet(response, 'status') as string | undefined;
+    if (status) {
+        span.setAttribute('llm.response.status', status);
+    }
+
+    // Extract usage
+    const usage = safeGet(response, 'usage') as Record<string, number> | undefined;
+    if (usage) {
+        span.setAttribute('llm.usage.source', 'provider_usage');
+        if (usage.input_tokens !== undefined) {
+            span.setAttribute('llm.usage.prompt_tokens', usage.input_tokens);
+            span.setAttribute('llm.usage.input_tokens', usage.input_tokens);
+            span.setAttribute('llm.usage.prompt_source', 'provider_usage');
+        }
+        if (usage.output_tokens !== undefined) {
+            span.setAttribute('llm.usage.completion_tokens', usage.output_tokens);
+            span.setAttribute('llm.usage.output_tokens', usage.output_tokens);
+            span.setAttribute('llm.usage.completion_source', 'provider_usage');
+        }
+        if (usage.total_tokens !== undefined) {
+            span.setAttribute('llm.usage.total_tokens', usage.total_tokens);
+        } else if (usage.input_tokens !== undefined && usage.output_tokens !== undefined) {
+            span.setAttribute(
+                'llm.usage.total_tokens',
+                usage.input_tokens + usage.output_tokens,
+            );
+        }
+    }
+}
+
+/** Terminal Responses stream events carry the full final response. */
+const RESPONSES_TERMINAL_EVENTS = new Set(['response.completed', 'response.incomplete', 'response.failed']);
+
+/**
+ * Wrap an OpenAI responses.create call (non-streaming and `stream: true`).
  */
 export function wrapOpenAIResponsesCreate<T>(
     createFn: (...args: unknown[]) => Promise<T>,
     instance: unknown
 ): (...args: unknown[]) => Promise<T> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return async function wrappedCreate(this: any, ...args: unknown[]): Promise<T> {
-        const tracer = getTracer('openai');
+    return function wrappedCreate(this: any, ...args: unknown[]): Promise<T> {
         const kwargs = (args[0] || {}) as Record<string, unknown>;
 
         const model = kwargs.model as string | undefined;
@@ -264,6 +368,9 @@ export function wrapOpenAIResponsesCreate<T>(
 
         if (model) {
             attributes['llm.model'] = model;
+        }
+        if (kwargs.stream === true) {
+            attributes['llm.streaming'] = true;
         }
 
         // Extract input
@@ -283,80 +390,22 @@ export function wrapOpenAIResponsesCreate<T>(
             }
         }
 
-        return tracer.startActiveSpan('llm.openai.responses', async (span: ISpan) => {
-            for (const [key, value] of Object.entries(attributes)) {
-                span.setAttribute(key, value);
-            }
-
-            let decision: Record<string, unknown> | undefined;
-            try {
-                decision = await enforceLlmCall(kwargs);
-                const response = await createFn.apply(instance || this, args);
-
-                // Extract output from response
-                const output = safeGet(response, 'output');
-                if (Array.isArray(output) && output.length > 0) {
-                    const textItems = output.filter(
-                        (item: unknown) =>
-                            typeof item === 'object' &&
-                            (item as Record<string, unknown>).type === 'text'
-                    );
-                    if (textItems.length > 0) {
-                        const text = (textItems[0] as Record<string, unknown>).text;
-                        if (typeof text === 'string') {
-                            span.setAttribute('llm.completion', text.slice(0, 1000));
-                            span.setAttribute('llm.response', text.slice(0, 1000));
-                        }
-                    }
+        return tracedProviderCall<{ final?: unknown }>(createFn, instance || this, args, {
+            tracerName: 'openai',
+            spanName: 'llm.openai.responses',
+            attributes,
+            onResponse: populateResponsesSpan,
+            initStreamState: () => ({}),
+            onStreamEvent: (_span, event, state) => {
+                if (RESPONSES_TERMINAL_EVENTS.has(String(safeGet(event, 'type')))) {
+                    state.final = safeGet(event, 'response');
                 }
-
-                const respModel = safeGet(response, 'model') as string | undefined;
-                if (respModel && !span.attributes['llm.model']) {
-                    span.setAttribute('llm.model', respModel);
+            },
+            onStreamEnd: (span, state) => {
+                if (state.final) {
+                    populateResponsesSpan(span, state.final);
                 }
-
-                const status = safeGet(response, 'status') as string | undefined;
-                if (status) {
-                    span.setAttribute('llm.response.status', status);
-                }
-
-                // Extract usage
-                const usage = safeGet(response, 'usage') as Record<string, number> | undefined;
-                if (usage) {
-                    span.setAttribute('llm.usage.source', 'provider_usage');
-                    if (usage.input_tokens !== undefined) {
-                        span.setAttribute('llm.usage.prompt_tokens', usage.input_tokens);
-                        span.setAttribute('llm.usage.input_tokens', usage.input_tokens);
-                        span.setAttribute('llm.usage.prompt_source', 'provider_usage');
-                    }
-                    if (usage.output_tokens !== undefined) {
-                        span.setAttribute('llm.usage.completion_tokens', usage.output_tokens);
-                        span.setAttribute('llm.usage.output_tokens', usage.output_tokens);
-                        span.setAttribute('llm.usage.completion_source', 'provider_usage');
-                    }
-                    if (usage.total_tokens !== undefined) {
-                        span.setAttribute('llm.usage.total_tokens', usage.total_tokens);
-                    } else if (usage.input_tokens !== undefined && usage.output_tokens !== undefined) {
-                        span.setAttribute(
-                            'llm.usage.total_tokens',
-                            usage.input_tokens + usage.output_tokens,
-                        );
-                    }
-                }
-
-                await finishLlmCall(decision);
-                return response;
-            } catch (error) {
-                await finishLlmCall(decision, { release: true }).catch(() => undefined);
-                if (error instanceof Error) {
-                    span.recordException(error);
-                    span.status = SpanStatus.ERROR;
-                    span.statusDescription = error.message;
-                }
-                throw error;
-            } finally {
-                span.end();
-            }
-        });
+            },
+        }) as unknown as Promise<T>;
     };
 }
