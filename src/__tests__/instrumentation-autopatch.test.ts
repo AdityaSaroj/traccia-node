@@ -5,6 +5,8 @@ import { patchAnthropic } from '../instrumentation/anthropic';
 import { getTracer } from '../auto';
 import { enforceLlmCall, finishLlmCall } from '../governance/pep';
 import { ISpan } from '../types';
+import { getAgentId, runIdentity } from '../config/runtime-config';
+import { getCurrentSpan } from '../context/context';
 
 jest.mock('../auto', () => ({
     getTracer: jest.fn(),
@@ -371,5 +373,111 @@ describe('OpenAI/Anthropic auto-patching against the real provider SDKs', () => 
             'llm.openai.chat.completions',
             'llm.openai.chat.completions',
         ]);
+    });
+    describe('review: authorization context is preserved through finalization', () => {
+        const captureSettlement = () => {
+            const seen: Array<{ agentId?: string; span?: unknown }> = [];
+            (finishLlmCall as jest.Mock).mockImplementationOnce(async () => {
+                seen.push({ agentId: getAgentId(), span: getCurrentSpan() });
+            });
+            return seen;
+        };
+
+        it('settles a stream authorized under agent A for agent A when consumed under agent B', async () => {
+            const seen = captureSettlement();
+            const client = new OpenAI({ apiKey: 'test', fetch: sseFetch(chatStreamEvents) });
+
+            const stream = await runIdentity({ agentId: 'agent-A' }, () =>
+                client.chat.completions.create({
+                    model: 'gpt-4o-mini',
+                    messages: [{ role: 'user', content: 'hello' }],
+                    stream: true,
+                })
+            );
+            await runIdentity({ agentId: 'agent-B' }, async () => {
+                for await (const chunk of stream) {
+                    void chunk;
+                }
+            });
+            await flush();
+
+            expect(seen).toEqual([{ agentId: 'agent-A', span }]);
+        });
+
+        it('settles for the authorizing agent when the result is consumed outside any identity scope', async () => {
+            const seen = captureSettlement();
+            const client = new OpenAI({
+                apiKey: 'test',
+                fetch: jsonFetch({
+                    id: 'c1', object: 'chat.completion', created: 0, model: 'gpt-4o-mini',
+                    choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+                }),
+            });
+
+            const pending = runIdentity({ agentId: 'agent-A' }, () =>
+                client.chat.completions.create({ model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'x' }] })
+            );
+            await pending;
+
+            expect(seen).toEqual([{ agentId: 'agent-A', span }]);
+        });
+    });
+
+    it('review: asResponse() leaves the body unread for the caller', async () => {
+        const client = new OpenAI({
+            apiKey: 'test',
+            fetch: jsonFetch({ id: 'c1', object: 'chat.completion', created: 0, model: 'gpt-4o-mini', choices: [] }),
+        });
+
+        const response = await client.chat.completions
+            .create({ model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'x' }] })
+            .asResponse();
+
+        await expect(response.json()).resolves.toMatchObject({ id: 'c1' });
+        expect(finishLlmCall).toHaveBeenCalledTimes(1);
+        expect(span.end).toHaveBeenCalledTimes(1);
+    });
+
+    it('review: fully consuming both .tee() branches ends the span and settles once', async () => {
+        const client = new OpenAI({ apiKey: 'test', fetch: sseFetch(chatStreamEvents) });
+        const stream = await client.chat.completions.create({
+            model: 'gpt-4o-mini',
+            messages: [{ role: 'user', content: 'hello' }],
+            stream: true,
+        });
+
+        const [left, right] = stream.tee();
+        const read = async (branch: typeof left) => {
+            let text = '';
+            for await (const chunk of branch) {
+                text += chunk.choices[0]?.delta?.content ?? '';
+            }
+            return text;
+        };
+        expect(await read(left)).toBe('Hello');
+        expect(await read(right)).toBe('Hello');
+        await flush();
+
+        expect(span.attributes['llm.completion']).toBe('Hello');
+        expect(finishLlmCall).toHaveBeenCalledTimes(1);
+        expect(finishLlmCall).toHaveBeenCalledWith(undefined, undefined);
+        expect(span.end).toHaveBeenCalledTimes(1);
+    });
+
+    it('review: aborting a stream before iterating releases the reservation and ends the span', async () => {
+        const client = new OpenAI({ apiKey: 'test', fetch: sseFetch(chatStreamEvents) });
+        const stream = await client.chat.completions.create({
+            model: 'gpt-4o-mini',
+            messages: [{ role: 'user', content: 'hello' }],
+            stream: true,
+        });
+
+        stream.controller.abort();
+        await flush();
+
+        expect(finishLlmCall).toHaveBeenCalledTimes(1);
+        expect(finishLlmCall).toHaveBeenCalledWith(undefined, { release: true });
+        expect(span.recordException).toHaveBeenCalled();
+        expect(span.end).toHaveBeenCalledTimes(1);
     });
 });

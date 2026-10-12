@@ -3,13 +3,19 @@
  *
  * Handles what a plain `async` wrapper cannot:
  * - Streaming (`stream: true`): the span and governance hold stay open until the
- *   returned stream is fully consumed, closed early, or errors.
+ *   returned stream is fully consumed (including through `.tee()` branches),
+ *   closed early, aborted, or errors.
+ * - Authorization context: governance is settled inside the async context that
+ *   authorized the call (run identity + span), even when the response or stream
+ *   is consumed from a different identity scope or none at all.
  * - Provider promise helpers: the provider SDKs return an `APIPromise` and call
  *   `.withResponse()` / `._thenUnwrap()` on it internally (e.g. Anthropic
- *   `messages.stream()`, OpenAI `chat.completions.parse()`), so the returned
- *   promise keeps those methods.
+ *   `messages.stream()`, OpenAI `chat.completions.parse()`). The returned promise
+ *   keeps those methods and, like `APIPromise`, only parses the body when the
+ *   data is requested, so `.asResponse()` hands back an unread body.
  */
 
+import { AsyncResource } from 'async_hooks';
 import { getTracer } from '../auto';
 import { runWithSpanAsync } from '../context/context';
 import { SpanStatus, ISpan } from '../types';
@@ -44,15 +50,29 @@ export interface ProviderPromise<T> extends Promise<T> {
     _thenUnwrap<U>(transform: (data: T, props: { response?: unknown }) => U): ProviderPromise<U>;
 }
 
-type AsyncIterableObject = { [Symbol.asyncIterator]: () => AsyncIterator<unknown> };
+/** What the original provider `create` returns (an `APIPromise` for the real SDKs). */
+type PendingCall = PromiseLike<unknown> & {
+    withResponse?: () => Promise<RawResult>;
+    asResponse?: () => Promise<unknown>;
+};
+
+/** Provider `Stream`: async iterable; the real SDKs also expose `iterator` and `controller`. */
+type StreamLike = {
+    [Symbol.asyncIterator]: () => AsyncIterator<unknown>;
+    iterator?: () => AsyncIterator<unknown>;
+    controller?: { signal?: AbortSignal };
+};
+
+type Transform = (data: unknown, props: { response?: unknown }) => unknown;
 
 const noop = (): void => undefined;
+const identity: Transform = (data) => data;
 
-function isAsyncIterable(value: unknown): value is AsyncIterableObject {
+function isStreamLike(value: unknown): value is StreamLike {
     return (
         typeof value === 'object' &&
         value !== null &&
-        typeof (value as Partial<AsyncIterableObject>)[Symbol.asyncIterator] === 'function'
+        typeof (value as Partial<StreamLike>)[Symbol.asyncIterator] === 'function'
     );
 }
 
@@ -74,23 +94,23 @@ function safely(fn: () => void): void {
 }
 
 /**
- * Re-point the stream's async iterator so each event is observed and `finish`
- * runs exactly once when iteration ends (done, break/return, or error).
- * The stream object itself is returned to the caller unchanged.
+ * Observe every event of a provider stream and call `finish` exactly once when it
+ * ends: done, break/return, error, or abort (including abort before iteration).
+ *
+ * The provider SDKs route direct iteration, `.tee()` and `toReadableStream()`
+ * through `stream.iterator()`, so that is wrapped when present; tee branches then
+ * share one observed source and `finish` runs when the source is exhausted.
  */
 function observeStream(
-    stream: AsyncIterableObject,
+    stream: StreamLike,
     onEvent: (event: unknown) => void,
     finish: (error?: unknown) => void
 ): void {
-    const iterate = stream[Symbol.asyncIterator];
-    const original = (): AsyncIterator<unknown> => iterate.call(stream) as AsyncIterator<unknown>;
-    stream[Symbol.asyncIterator] = function observedIterator(): AsyncIterator<unknown> {
-        const it: AsyncIterator<unknown> = original();
+    const observe = (source: AsyncIterator<unknown>): AsyncIterator<unknown> => {
         const iterator: AsyncIterator<unknown> & { [Symbol.asyncIterator](): AsyncIterator<unknown> } = {
             async next(...nextArgs: [] | [unknown]): Promise<IteratorResult<unknown>> {
                 try {
-                    const result: IteratorResult<unknown> = await it.next(...nextArgs);
+                    const result: IteratorResult<unknown> = await source.next(...nextArgs);
                     if (result.done) {
                         finish();
                     } else {
@@ -104,11 +124,11 @@ function observeStream(
             },
             return(value?: unknown): Promise<IteratorResult<unknown>> {
                 finish();
-                return it.return ? it.return(value) : Promise.resolve({ done: true, value });
+                return source.return ? source.return(value) : Promise.resolve({ done: true, value });
             },
             throw(error?: unknown): Promise<IteratorResult<unknown>> {
                 finish(error);
-                return it.throw ? it.throw(error) : Promise.reject(error);
+                return source.throw ? source.throw(error) : Promise.reject(error);
             },
             [Symbol.asyncIterator]() {
                 return iterator;
@@ -116,22 +136,85 @@ function observeStream(
         };
         return iterator;
     };
+
+    if (typeof stream.iterator === 'function') {
+        const original = stream.iterator;
+        stream.iterator = function observedIterator(): AsyncIterator<unknown> {
+            return observe(original.call(stream) as AsyncIterator<unknown>);
+        };
+    } else {
+        const original = stream[Symbol.asyncIterator];
+        stream[Symbol.asyncIterator] = function observedIterator(): AsyncIterator<unknown> {
+            return observe(original.call(stream) as AsyncIterator<unknown>);
+        };
+    }
+
+    const signal = stream.controller?.signal;
+    if (signal && typeof signal.addEventListener === 'function') {
+        const onAbort = (): void => finish(new Error('Stream aborted before completion'));
+        if (signal.aborted) {
+            onAbort();
+        } else {
+            signal.addEventListener('abort', onAbort, { once: true });
+        }
+    }
 }
 
-function toProviderPromise<T>(raw: Promise<RawResult>): ProviderPromise<T> {
-    const data = raw.then((r) => r.data as T);
-    // Callers may only use withResponse()/asResponse(); don't surface the same
-    // rejection twice as unhandled. Awaiting `data` still rejects normally.
-    data.catch(noop);
-    return Object.assign(data, {
-        withResponse: () => raw,
-        asResponse: () => raw.then((r) => r.response),
-        parse: () => data,
-        _thenUnwrap: <U>(transform: (value: T, props: { response?: unknown }) => U) =>
-            toProviderPromise<U>(
-                raw.then((r) => ({ ...r, data: transform(r.data as T, { response: r.response }) }))
-            ),
-    });
+/**
+ * `APIPromise`-compatible promise: parsing starts only when the data is requested
+ * (`then`/`await`, `withResponse()`, `parse()`), never for `asResponse()`.
+ */
+class LazyProviderPromise<T> extends Promise<T> implements ProviderPromise<T> {
+    public static get [Symbol.species](): PromiseConstructor {
+        return Promise;
+    }
+
+    private unwrapped?: Promise<RawResult>;
+
+    public constructor(
+        private readonly getRaw: () => Promise<RawResult>,
+        private readonly getResponse: () => Promise<unknown>,
+        private readonly transform: Transform = identity
+    ) {
+        super((resolve) => resolve(undefined as T));
+    }
+
+    public withResponse(): Promise<RawResult> {
+        this.unwrapped ??= this.getRaw().then((r) => ({
+            ...r,
+            data: this.transform(r.data, { response: r.response }),
+        }));
+        return this.unwrapped;
+    }
+
+    public asResponse(): Promise<unknown> {
+        return this.getResponse();
+    }
+
+    public parse(): Promise<T> {
+        return this.withResponse().then((r) => r.data as T);
+    }
+
+    public _thenUnwrap<U>(fn: (data: T, props: { response?: unknown }) => U): ProviderPromise<U> {
+        return new LazyProviderPromise<U>(this.getRaw, this.getResponse, (data, props) =>
+            fn(this.transform(data, props) as T, props)
+        );
+    }
+
+    public then<R1 = T, R2 = never>(
+        onfulfilled?: ((value: T) => R1 | PromiseLike<R1>) | null,
+        onrejected?: ((reason: unknown) => R2 | PromiseLike<R2>) | null
+    ): Promise<R1 | R2> {
+        return this.parse().then(onfulfilled, onrejected);
+    }
+
+    public catch<R = never>(onrejected?: ((reason: unknown) => R | PromiseLike<R>) | null): Promise<T | R> {
+        return this.parse().catch(onrejected);
+    }
+
+    public finally(onfinally?: (() => void) | null): Promise<T> {
+        return this.parse().finally(onfinally);
+    }
 }
 
 /**
@@ -151,49 +234,92 @@ export function tracedProviderCall<S>(
     }
 
     let decision: Record<string, unknown> | undefined;
+    // Replaced once the call is authorized: runs `fn` in that async context, so
+    // settlement sees the authorizing agent/run identity and trace.
+    let inAuthScope = <R>(fn: () => R): R => fn();
+    let finalized: Promise<void> | undefined;
+    let isFinalized = false;
 
-    const raw = runWithSpanAsync(span, async (): Promise<RawResult> => {
-        try {
-            decision = await enforceLlmCall(kwargs);
-            const pending = createFn.apply(thisArg, args) as { withResponse?: () => Promise<RawResult> };
-            const result: RawResult =
-                typeof pending?.withResponse === 'function'
-                    ? await pending.withResponse()
-                    : { data: await (pending as Promise<unknown>) };
-
-            if (kwargs.stream === true && isAsyncIterable(result.data)) {
-                const state = hooks.initStreamState();
-                let finished = false;
-                observeStream(
-                    result.data,
-                    (event) => safely(() => hooks.onStreamEvent(span, event, state)),
-                    (error) => {
-                        if (finished) return;
-                        finished = true;
-                        if (error === undefined) {
-                            safely(() => hooks.onStreamEnd(span, state));
-                        } else {
-                            recordError(span, error);
-                        }
-                        finishLlmCall(decision, error === undefined ? undefined : { release: true })
-                            .catch(noop)
-                            .finally(() => span.end());
-                    }
-                );
-                return result;
+    const finalize = (error?: unknown): Promise<void> => {
+        if (!isFinalized) {
+            isFinalized = true;
+            if (error !== undefined) {
+                recordError(span, error);
             }
-
-            safely(() => hooks.onResponse(span, result.data));
-            await finishLlmCall(decision);
-            span.end();
-            return result;
-        } catch (error) {
-            await finishLlmCall(decision, { release: true }).catch(noop);
-            recordError(span, error);
-            span.end();
-            throw error;
+            finalized = inAuthScope(() =>
+                finishLlmCall(decision, error === undefined ? undefined : { release: true })
+            )
+                .catch(noop)
+                .finally(() => span.end());
         }
-    });
+        return finalized ?? Promise.resolve();
+    };
 
-    return toProviderPromise(raw);
+    // The request starts eagerly (like the provider APIPromise); parsing is lazy.
+    const request = runWithSpanAsync(span, async (): Promise<{ pending: PendingCall }> => {
+        decision = await enforceLlmCall(kwargs);
+        const scope = new AsyncResource('traccia.llm_call');
+        inAuthScope = (fn) => scope.runInAsyncScope(fn);
+        // Wrapped in an object: returning the thenable APIPromise directly would await it and parse the body.
+        return { pending: createFn.apply(thisArg, args) as PendingCall };
+    });
+    request.catch((error) => finalize(error));
+
+    let parsed: Promise<RawResult> | undefined;
+    let parseStarted = false;
+    const getRaw = (): Promise<RawResult> => {
+        parseStarted = true;
+        parsed ??= request.then(async ({ pending }) => {
+            try {
+                const result: RawResult =
+                    typeof pending?.withResponse === 'function'
+                        ? await pending.withResponse()
+                        : { data: await pending };
+
+                if (kwargs.stream === true && isStreamLike(result.data)) {
+                    const state = hooks.initStreamState();
+                    observeStream(
+                        result.data,
+                        (event) => safely(() => hooks.onStreamEvent(span, event, state)),
+                        (error) => {
+                            if (error === undefined && !isFinalized) {
+                                safely(() => hooks.onStreamEnd(span, state));
+                            }
+                            void finalize(error);
+                        }
+                    );
+                    return result;
+                }
+
+                safely(() => hooks.onResponse(span, result.data));
+                await finalize();
+                return result;
+            } catch (error) {
+                await finalize(error);
+                throw error;
+            }
+        });
+        return parsed;
+    };
+
+    const getResponse = (): Promise<unknown> =>
+        request.then(async ({ pending }) => {
+            if (typeof pending?.asResponse !== 'function') {
+                return (await getRaw()).response;
+            }
+            try {
+                const response = await pending.asResponse();
+                if (!parseStarted) {
+                    // Raw response only: the body is the caller's to read, so there is
+                    // no content or usage to record.
+                    await finalize();
+                }
+                return response;
+            } catch (error) {
+                await finalize(error);
+                throw error;
+            }
+        });
+
+    return new LazyProviderPromise<unknown>(getRaw, getResponse);
 }
