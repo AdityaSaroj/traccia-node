@@ -81,25 +81,34 @@ export function redactString(text: string | null | undefined): string {
   return result;
 }
 
+/**
+ * Redact a value recursively. Strings are redacted when `redactAllStrings` is set or
+ * when their key, or any ancestor key, is sensitive (so `{ result: { answer } }` is covered).
+ */
 export function redactValue(
   value: unknown,
-  options?: { redactAllStrings?: boolean; key?: string; extraKeyFragments?: ReadonlySet<string> },
+  options?: {
+    redactAllStrings?: boolean;
+    key?: string;
+    extraKeyFragments?: ReadonlySet<string>;
+    /** Internal: an ancestor key was sensitive. */
+    sensitive?: boolean;
+  },
 ): unknown {
   const fragments = options?.extraKeyFragments ?? DEFAULT_SENSITIVE_KEY_FRAGMENTS;
+  const sensitive =
+    !!options?.sensitive || !!options?.redactAllStrings || keyIsSensitive(options?.key ?? "", fragments);
   if (typeof value === "string") {
-    if (options?.redactAllStrings || keyIsSensitive(options?.key ?? "", fragments)) {
-      return redactString(value);
-    }
-    return value;
+    return sensitive ? redactString(value) : value;
   }
   if (Array.isArray(value)) {
-    return value.map((v) => redactValue(v, options));
+    return value.map((v) => redactValue(v, { ...options, sensitive }));
   }
   if (value !== null && typeof value === "object") {
     const obj = value as Record<string, unknown>;
     const result: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(obj)) {
-      result[k] = redactValue(v, { ...options, key: k });
+      result[k] = redactValue(v, { ...options, key: k, sensitive });
     }
     return result;
   }
