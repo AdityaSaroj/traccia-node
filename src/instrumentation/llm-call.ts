@@ -84,6 +84,27 @@ function recordError(span: ISpan, error: unknown): void {
     }
 }
 
+/** Non-enumerable request metadata the provider SDKs attach to parsed responses. */
+const REQUEST_METADATA_KEYS = ['_request_id', '_workspace_id'];
+
+/**
+ * Copy provider request metadata onto a transformed result, as the native
+ * `APIPromise#_thenUnwrap()` does (e.g. `chat.completions.parse()` returns a new
+ * object that would otherwise lose `_request_id`).
+ */
+function carryRequestMetadata(from: unknown, to: unknown): unknown {
+    if (!from || typeof from !== 'object' || !to || typeof to !== 'object' || Array.isArray(to)) {
+        return to;
+    }
+    for (const key of REQUEST_METADATA_KEYS) {
+        const descriptor = Object.getOwnPropertyDescriptor(from, key);
+        if (descriptor && !Object.prototype.hasOwnProperty.call(to, key)) {
+            Object.defineProperty(to, key, { value: descriptor.value as unknown, enumerable: false });
+        }
+    }
+    return to;
+}
+
 /** Span population must never break the caller's request. */
 function safely(fn: () => void): void {
     try {
@@ -196,8 +217,10 @@ class LazyProviderPromise<T> extends Promise<T> implements ProviderPromise<T> {
     }
 
     public _thenUnwrap<U>(fn: (data: T, props: { response?: unknown }) => U): ProviderPromise<U> {
-        return new LazyProviderPromise<U>(this.getRaw, this.getResponse, (data, props) =>
-            fn(this.transform(data, props) as T, props)
+        return new LazyProviderPromise<U>(this.getRaw, this.getResponse, (data, props) => {
+            const source = this.transform(data, props);
+            return carryRequestMetadata(source, fn(source as T, props));
+        }
         );
     }
 

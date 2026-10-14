@@ -480,4 +480,26 @@ describe('OpenAI/Anthropic auto-patching against the real provider SDKs', () => 
         expect(span.recordException).toHaveBeenCalled();
         expect(span.end).toHaveBeenCalledTimes(1);
     });
+
+    it('review: keeps _request_id on create() and on parse() results (via _thenUnwrap)', async () => {
+        const body = {
+            id: 'c1', object: 'chat.completion', created: 0, model: 'gpt-4o-mini',
+            choices: [{ index: 0, message: { role: 'assistant', content: '{"a":1}', refusal: null }, finish_reason: 'stop' }],
+        };
+        const fetchFn = jest.fn(async () =>
+            new Response(JSON.stringify(body), {
+                status: 200,
+                headers: { 'content-type': 'application/json', 'x-request-id': 'req_test' },
+            })
+        );
+        const client = new OpenAI({ apiKey: 'test', fetch: fetchFn });
+        const params = { model: 'gpt-4o-mini', messages: [{ role: 'user' as const, content: 'x' }] };
+
+        const created = await client.chat.completions.create(params);
+        expect(created._request_id).toBe('req_test');
+
+        const parsed = await client.chat.completions.parse({ ...params, response_format: { type: 'json_object' } });
+        expect(parsed._request_id).toBe('req_test');
+        expect(Object.keys(parsed)).not.toContain('_request_id');
+    });
 });
