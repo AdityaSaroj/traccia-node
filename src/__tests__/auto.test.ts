@@ -137,4 +137,22 @@ describe('Auto Instrumentation', () => {
         });
         expect(OtlpExporter).toHaveBeenCalled();
     });
+
+    it('logs spans only after redaction when redactPii and span logging are on', async () => {
+        const customExporter: ISpanExporter = {
+            export: jest.fn().mockResolvedValue(true),
+            shutdown: jest.fn().mockResolvedValue(undefined)
+        };
+        // Snapshot at call time: later processors mutate the same attributes object.
+        const lines: string[] = [];
+        const log = jest.spyOn(console, 'log').mockImplementation((...args) => { lines.push(JSON.stringify(args)); });
+        await startTracing({ exporter: customExporter, redactPii: true, enableSpanLogging: true });
+        const span = getTracer('test').startSpan('pii');
+        span.setAttribute('llm.prompt', 'mail x@y.io');
+        span.end();
+        const logged = lines.join(' ');
+        log.mockRestore();
+        expect(logged).toContain('[Span] pii');
+        expect(logged).not.toContain('x@y.io');
+    });
 });
