@@ -42,7 +42,7 @@ describe('OpenAI Instrumentation', () => {
                 jest.doMock('openai', () => {
                     class Completions { create() { return Promise.resolve({}); } }
                     return { OpenAI: { Chat: { Completions } } };
-                }, { virtual: true });
+                });
 
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
                 const fresh = require('../instrumentation/openai');
@@ -61,7 +61,7 @@ describe('OpenAI Instrumentation', () => {
             jest.isolateModules(() => {
                 jest.doMock('openai', () => {
                     throw new Error('Cannot find module \'openai\'');
-                }, { virtual: true });
+                });
 
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
                 const fresh = require('../instrumentation/openai');
@@ -74,7 +74,7 @@ describe('OpenAI Instrumentation', () => {
 
         it('should return false when openai resolves to a falsy module', () => {
             jest.isolateModules(() => {
-                jest.doMock('openai', () => null, { virtual: true });
+                jest.doMock('openai', () => null);
 
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
                 const fresh = require('../instrumentation/openai');
@@ -89,7 +89,7 @@ describe('OpenAI Instrumentation', () => {
                 jest.doMock('openai', () => {
                     class Completions { create() { return Promise.resolve({}); } }
                     return { OpenAI: { Chat: { Completions } } };
-                }, { virtual: true });
+                });
 
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
                 const fresh = require('../instrumentation/openai');
@@ -98,7 +98,7 @@ describe('OpenAI Instrumentation', () => {
                 jest.dontMock('openai');
                 jest.doMock('openai', () => {
                     throw new Error('should never be reached');
-                }, { virtual: true });
+                });
                 expect(fresh.patchOpenAI()).toBe(true);
 
                 jest.dontMock('openai');
@@ -109,7 +109,7 @@ describe('OpenAI Instrumentation', () => {
             jest.isolateModules(() => {
                 jest.doMock('openai', () => ({
                     OpenAI: {},
-                }), { virtual: true });
+                }));
 
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
                 const fresh = require('../instrumentation/openai');
@@ -123,7 +123,7 @@ describe('OpenAI Instrumentation', () => {
             jest.isolateModules(() => {
                 jest.doMock('openai', () => ({
                     OpenAI: { prototype: {} },
-                }), { virtual: true });
+                }));
 
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
                 const fresh = require('../instrumentation/openai');
@@ -140,7 +140,7 @@ describe('OpenAI Instrumentation', () => {
                 jest.doMock('openai', () => {
                     class Responses { create() { return Promise.resolve({}); } }
                     return { OpenAI: { Responses } };
-                }, { virtual: true });
+                });
 
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
                 const fresh = require('../instrumentation/openai');
@@ -159,7 +159,7 @@ describe('OpenAI Instrumentation', () => {
             jest.isolateModules(() => {
                 jest.doMock('openai', () => {
                     throw new Error('Cannot find module \'openai\'');
-                }, { virtual: true });
+                });
 
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
                 const fresh = require('../instrumentation/openai');
@@ -172,7 +172,7 @@ describe('OpenAI Instrumentation', () => {
 
         it('should return false when openai resolves to a falsy module', () => {
             jest.isolateModules(() => {
-                jest.doMock('openai', () => null, { virtual: true });
+                jest.doMock('openai', () => null);
 
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
                 const fresh = require('../instrumentation/openai');
@@ -187,7 +187,7 @@ describe('OpenAI Instrumentation', () => {
                 jest.doMock('openai', () => {
                     class Responses { create() { return Promise.resolve({}); } }
                     return { OpenAI: { Responses } };
-                }, { virtual: true });
+                });
 
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
                 const fresh = require('../instrumentation/openai');
@@ -196,7 +196,7 @@ describe('OpenAI Instrumentation', () => {
                 jest.dontMock('openai');
                 jest.doMock('openai', () => {
                     throw new Error('should never be reached');
-                }, { virtual: true });
+                });
                 expect(fresh.patchOpenAIResponses()).toBe(true);
 
                 jest.dontMock('openai');

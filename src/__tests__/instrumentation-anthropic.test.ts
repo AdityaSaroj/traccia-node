@@ -39,7 +39,7 @@ describe('Anthropic Instrumentation', () => {
                 jest.doMock('@anthropic-ai/sdk', () => {
                     class Messages { create() { return Promise.resolve({}); } }
                     return { Anthropic: { Messages } };
-                }, { virtual: true });
+                });
 
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
                 const fresh = require('../instrumentation/anthropic');
@@ -58,7 +58,7 @@ describe('Anthropic Instrumentation', () => {
             jest.isolateModules(() => {
                 jest.doMock('@anthropic-ai/sdk', () => {
                     throw new Error('Cannot find module \'@anthropic-ai/sdk\'');
-                }, { virtual: true });
+                });
 
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
                 const fresh = require('../instrumentation/anthropic');
@@ -71,7 +71,7 @@ describe('Anthropic Instrumentation', () => {
 
         it('should return false when Messages has no create to wrap', () => {
             jest.isolateModules(() => {
-                jest.doMock('@anthropic-ai/sdk', () => ({ Anthropic: {} }), { virtual: true });
+                jest.doMock('@anthropic-ai/sdk', () => ({ Anthropic: {} }));
 
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
                 const fresh = require('../instrumentation/anthropic');
@@ -83,7 +83,7 @@ describe('Anthropic Instrumentation', () => {
 
         it('should return false when @anthropic-ai/sdk resolves to a falsy module', () => {
             jest.isolateModules(() => {
-                jest.doMock('@anthropic-ai/sdk', () => null, { virtual: true });
+                jest.doMock('@anthropic-ai/sdk', () => null);
 
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
                 const fresh = require('../instrumentation/anthropic');
@@ -98,7 +98,7 @@ describe('Anthropic Instrumentation', () => {
                 jest.doMock('@anthropic-ai/sdk', () => {
                     class Messages { create() { return Promise.resolve({}); } }
                     return { Anthropic: { Messages } };
-                }, { virtual: true });
+                });
 
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
                 const fresh = require('../instrumentation/anthropic');
@@ -107,7 +107,7 @@ describe('Anthropic Instrumentation', () => {
                 jest.dontMock('@anthropic-ai/sdk');
                 jest.doMock('@anthropic-ai/sdk', () => {
                     throw new Error('should never be reached');
-                }, { virtual: true });
+                });
                 expect(fresh.patchAnthropic()).toBe(true);
 
                 jest.dontMock('@anthropic-ai/sdk');
