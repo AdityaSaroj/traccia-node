@@ -63,6 +63,9 @@ export class Span implements ISpan {
 
   /**
    * Add an event to the span.
+   *
+   * Events are buffered and flushed to OTel in end(), after enrichment
+   * processors (e.g. redaction) have had a chance to rewrite them.
    */
   addEvent(name: string, attributes?: Record<string, unknown>): void {
     if (this.ended) return;
@@ -71,21 +74,21 @@ export class Span implements ISpan {
       timestamp: Math.floor((performance.timeOrigin + performance.now()) * 1_000_000),
       attributes: attributes ? { ...attributes } : {},
     });
-    this.otelSpan.addEvent(name, attributes as any);
   }
 
   /**
-   * Record an exception on the span.
+   * Record an exception on the span (buffered like addEvent).
    */
   recordException(error: Error, attributes?: Record<string, unknown>): void {
     if (this.ended) return;
     this.status = SpanStatus.ERROR;
-    this.statusDescription = error.message;
-    this.otelSpan.setStatus({
-      code: SpanStatusCode.ERROR,
-      message: error.message
+    this.statusDescription = error?.message;
+    this.addEvent('exception', {
+      'exception.type': error?.name,
+      'exception.message': error?.message,
+      'exception.stacktrace': error?.stack,
+      ...attributes,
     });
-    this.otelSpan.recordException(error);
   }
 
   /**
@@ -104,7 +107,24 @@ export class Span implements ISpan {
     }
 
     this.ended = true;
+    this.flushToOtel();
     this.otelSpan.end();
+  }
+
+  private flushToOtel(): void {
+    for (const event of this.events) {
+      const attrs: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(event.attributes ?? {})) {
+        if (v !== undefined && v !== null) attrs[k] = v;
+      }
+      // SpanEvent.timestamp is epoch ns; OTel accepts [seconds, nanos]
+      const ns = event.timestamp;
+      const time: [number, number] = [Math.floor(ns / 1e9), Math.floor(ns % 1e9)];
+      this.otelSpan.addEvent(event.name, attrs as any, time);
+    }
+    if (this.status === SpanStatus.ERROR) {
+      this.otelSpan.setStatus({ code: SpanStatusCode.ERROR, message: this.statusDescription });
+    }
   }
 
   /**

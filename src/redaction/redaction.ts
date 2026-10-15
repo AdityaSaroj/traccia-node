@@ -27,6 +27,9 @@ export const DEFAULT_SENSITIVE_KEY_FRAGMENTS: ReadonlySet<string> = new Set([
   "body",
   "query",
   "response",
+  "result",
+  "exception",
+  "error",
   "user",
   "assistant",
   "phi",
@@ -78,25 +81,34 @@ export function redactString(text: string | null | undefined): string {
   return result;
 }
 
+/**
+ * Redact a value recursively. Strings are redacted when `redactAllStrings` is set or
+ * when their key, or any ancestor key, is sensitive (so `{ result: { answer } }` is covered).
+ */
 export function redactValue(
   value: unknown,
-  options?: { redactAllStrings?: boolean; key?: string; extraKeyFragments?: ReadonlySet<string> },
+  options?: {
+    redactAllStrings?: boolean;
+    key?: string;
+    extraKeyFragments?: ReadonlySet<string>;
+    /** Internal: an ancestor key was sensitive. */
+    sensitive?: boolean;
+  },
 ): unknown {
   const fragments = options?.extraKeyFragments ?? DEFAULT_SENSITIVE_KEY_FRAGMENTS;
+  const sensitive =
+    !!options?.sensitive || !!options?.redactAllStrings || keyIsSensitive(options?.key ?? "", fragments);
   if (typeof value === "string") {
-    if (options?.redactAllStrings || keyIsSensitive(options?.key ?? "", fragments)) {
-      return redactString(value);
-    }
-    return value;
+    return sensitive ? redactString(value) : value;
   }
   if (Array.isArray(value)) {
-    return value.map((v) => redactValue(v, options));
+    return value.map((v) => redactValue(v, { ...options, sensitive }));
   }
   if (value !== null && typeof value === "object") {
     const obj = value as Record<string, unknown>;
     const result: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(obj)) {
-      result[k] = redactValue(v, { ...options, key: k });
+      result[k] = redactValue(v, { ...options, key: k, sensitive });
     }
     return result;
   }
@@ -118,41 +130,82 @@ export function redactAttributes(
       out[key] = value;
       continue;
     }
-    if (typeof value === "string" && (options?.redactAllStrings || keyIsSensitive(key, fragments))) {
-      out[key] = redactString(value);
-    } else {
-      out[key] = redactValue(value, { ...options, key, extraKeyFragments: fragments });
-    }
+    out[key] = redactValue(value, { ...options, key, extraKeyFragments: fragments });
   }
   out[REDACTION_APPLIED] = true;
   return out;
 }
 
+function valuesEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch {
+    return false;
+  }
+}
+
+type RedactableSpan = {
+  attributes?: Record<string, unknown>;
+  events?: Array<{ attributes?: Record<string, unknown> }>;
+  statusDescription?: string;
+  setAttribute?: (key: string, value: unknown) => void;
+};
+
+/**
+ * Redact attributes, buffered events (including exceptions) and the status
+ * description on a mutable span. Returns the number of fields changed.
+ * With `setUnchanged`, primitive attributes are re-set even when unchanged.
+ */
 export function applyRedactionToSpan(
-  span: { attributes?: Record<string, unknown>; setAttribute?: (key: string, value: unknown) => void },
-  options?: { extraKeyFragments?: Iterable<string> },
+  span: RedactableSpan,
+  options?: { extraKeyFragments?: Iterable<string>; redactAllStrings?: boolean; setUnchanged?: boolean },
 ): number {
   if (!span || typeof span.setAttribute !== "function") {
     return 0;
   }
-  const raw = { ...(span.attributes ?? {}) };
-  if (Object.keys(raw).length === 0) {
-    return 0;
-  }
-  const fragments = new Set(DEFAULT_SENSITIVE_KEY_FRAGMENTS);
-  for (const f of options?.extraKeyFragments ?? []) {
-    fragments.add(f);
-  }
-  const redacted = redactAttributes(raw, { extraKeyFragments: fragments });
+  const redactOpts = { extraKeyFragments: options?.extraKeyFragments, redactAllStrings: options?.redactAllStrings };
   let changed = 0;
-  for (const [key, value] of Object.entries(redacted)) {
-    if (key === REDACTION_APPLIED) continue;
-    if (raw[key] !== value) {
-      span.setAttribute!(key, value);
+
+  const raw = { ...(span.attributes ?? {}) };
+  const hasAttrs = Object.keys(raw).length > 0;
+  if (hasAttrs) {
+    const redacted = redactAttributes(raw, redactOpts);
+    for (const [key, value] of Object.entries(redacted)) {
+      if (key === REDACTION_APPLIED) continue;
+      if (!valuesEqual(raw[key], value)) {
+        span.setAttribute!(key, value);
+        changed++;
+      } else if (
+        options?.setUnchanged &&
+        (typeof value === "string" || typeof value === "number" || typeof value === "boolean")
+      ) {
+        span.setAttribute!(key, value);
+      }
+    }
+  }
+
+  for (const event of Array.isArray(span.events) ? span.events : []) {
+    if (!event?.attributes || Object.keys(event.attributes).length === 0) continue;
+    const redacted = redactAttributes(event.attributes, redactOpts);
+    delete redacted[REDACTION_APPLIED];
+    if (!valuesEqual(event.attributes, redacted)) {
+      event.attributes = redacted;
       changed++;
     }
   }
-  if (changed > 0 || redacted[REDACTION_APPLIED]) {
+
+  // Error status descriptions are exception messages: always scrub them.
+  if (typeof span.statusDescription === "string" && span.statusDescription) {
+    const scrubbed = redactString(span.statusDescription);
+    if (scrubbed !== span.statusDescription) {
+      span.statusDescription = scrubbed;
+      changed++;
+    }
+  }
+
+  if (hasAttrs || changed > 0) {
     span.setAttribute!(REDACTION_APPLIED, true);
   }
   return changed;

@@ -247,10 +247,6 @@ export async function init(config: SDKConfig = {}): Promise<TracerProvider> {
     setResolver(new CostResolver(pricing, pricingSource, pricingGeneratedAt));
   }
 
-  if (config.enableSpanLogging || loadedConfig.logging.enable_span_logging) {
-    provider.addSpanProcessor(new LoggingSpanProcessor());
-  }
-
   provider.addSpanProcessor(
     new AgentEnrichmentProcessor({
       agentConfigPath: agentConfigPath,
@@ -278,6 +274,11 @@ export async function init(config: SDKConfig = {}): Promise<TracerProvider> {
   }
   if (redactPii) {
     provider.addSpanProcessor(new RedactionSpanProcessor());
+  }
+
+  // Log after enrichment and redaction so span logs never contain unredacted values.
+  if (config.enableSpanLogging || loadedConfig.logging.enable_span_logging) {
+    provider.addSpanProcessor(new LoggingSpanProcessor());
   }
 
   // Add batch processor with exporter
