@@ -18,7 +18,8 @@ describe('Anthropic Instrumentation', () => {
         } as unknown as ISpan;
 
         mockTracer = {
-            startActiveSpan: jest.fn((name, fn) => fn(mockSpan))
+            startActiveSpan: jest.fn((name, fn) => fn(mockSpan)),
+            startSpan: jest.fn(() => mockSpan),
         };
 
         (getTracer as jest.Mock).mockReturnValue(mockTracer);
@@ -33,13 +34,21 @@ describe('Anthropic Instrumentation', () => {
         // test a fresh module instance (fresh `_patched = false`) so every branch
         // is actually exercised. See src/instrumentation/gemini.ts's equivalent
         // fix for the same underlying bug.
-        it('should patch when anthropic is available', () => {
+        it('should wrap Messages.prototype.create when anthropic is available', () => {
             jest.isolateModules(() => {
-                jest.doMock('@anthropic-ai/sdk', () => ({}), { virtual: true });
+                jest.doMock('@anthropic-ai/sdk', () => {
+                    class Messages { create() { return Promise.resolve({}); } }
+                    return { Anthropic: { Messages } };
+                });
 
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
                 const fresh = require('../instrumentation/anthropic');
+                // eslint-disable-next-line @typescript-eslint/no-require-imports
+                const proto = require('@anthropic-ai/sdk').Anthropic.Messages.prototype;
+                const original = proto.create;
                 expect(fresh.patchAnthropic()).toBe(true);
+                expect(proto.create).not.toBe(original);
+                expect(proto.create._agentTracePatched).toBe(true);
 
                 jest.dontMock('@anthropic-ai/sdk');
             });
@@ -49,7 +58,7 @@ describe('Anthropic Instrumentation', () => {
             jest.isolateModules(() => {
                 jest.doMock('@anthropic-ai/sdk', () => {
                     throw new Error('Cannot find module \'@anthropic-ai/sdk\'');
-                }, { virtual: true });
+                });
 
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
                 const fresh = require('../instrumentation/anthropic');
@@ -60,9 +69,21 @@ describe('Anthropic Instrumentation', () => {
             });
         });
 
+        it('should return false when Messages has no create to wrap', () => {
+            jest.isolateModules(() => {
+                jest.doMock('@anthropic-ai/sdk', () => ({ Anthropic: {} }));
+
+                // eslint-disable-next-line @typescript-eslint/no-require-imports
+                const fresh = require('../instrumentation/anthropic');
+                expect(fresh.patchAnthropic()).toBe(false);
+
+                jest.dontMock('@anthropic-ai/sdk');
+            });
+        });
+
         it('should return false when @anthropic-ai/sdk resolves to a falsy module', () => {
             jest.isolateModules(() => {
-                jest.doMock('@anthropic-ai/sdk', () => null, { virtual: true });
+                jest.doMock('@anthropic-ai/sdk', () => null);
 
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
                 const fresh = require('../instrumentation/anthropic');
@@ -74,7 +95,10 @@ describe('Anthropic Instrumentation', () => {
 
         it('should return true on subsequent calls without re-checking the module', () => {
             jest.isolateModules(() => {
-                jest.doMock('@anthropic-ai/sdk', () => ({}), { virtual: true });
+                jest.doMock('@anthropic-ai/sdk', () => {
+                    class Messages { create() { return Promise.resolve({}); } }
+                    return { Anthropic: { Messages } };
+                });
 
                 // eslint-disable-next-line @typescript-eslint/no-require-imports
                 const fresh = require('../instrumentation/anthropic');
@@ -83,7 +107,7 @@ describe('Anthropic Instrumentation', () => {
                 jest.dontMock('@anthropic-ai/sdk');
                 jest.doMock('@anthropic-ai/sdk', () => {
                     throw new Error('should never be reached');
-                }, { virtual: true });
+                });
                 expect(fresh.patchAnthropic()).toBe(true);
 
                 jest.dontMock('@anthropic-ai/sdk');
@@ -110,7 +134,7 @@ describe('Anthropic Instrumentation', () => {
             });
 
             expect(getTracer).toHaveBeenCalledWith('anthropic');
-            expect(mockTracer.startActiveSpan).toHaveBeenCalledWith('llm.anthropic.messages', expect.any(Function));
+            expect(mockTracer.startSpan).toHaveBeenCalledWith('llm.anthropic.messages');
             
             expect(mockSpan.setAttribute).toHaveBeenCalledWith('llm.vendor', 'anthropic');
             expect(mockSpan.setAttribute).toHaveBeenCalledWith('llm.model', 'claude-3-opus-20240229');
