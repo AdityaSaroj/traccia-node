@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.1.19] - 2026-10-21
+
+### Added
+- `traccia-ts eval` matches `traccia eval`: same flags, `summary.json`, and exit codes. Exit 0 with no pass-rate bar is Execution Only. `--max-drop 0.05` is five percentage points. Cost and latency caps are relative (`0.2` is 20 percent). A summary path that cannot be created returns exit 5.
+- `local:` scorers have no definition hash, so `--max-drop` ends in `scorer_definition_unhashed`. A scorer selected by id is grouped under the name on its result.
+- Each Jev question is its own gate, named `{scorer}:{question}`.
+- `traccia-ts eval` sends provider API keys from the environment (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` or `GOOGLE_API_KEY`, `GROQ_API_KEY`, `TYPESAFE_API_KEY`, or `TRACCIA_PROVIDER_KEYS`) and does not write them into the summary.
+- Task cost includes priced provider child spans on the SDK tracer provider. The packaged CLI and a task that imports the public SDK share one tracer, so that cost is counted.
+- `createExperiment` retries a 5xx. The client-generated experiment id makes the retry safe.
+- `evaluate()` keeps scorer `status`. An execution error stays `status: error` with no score, including remote platform scorers. Task cost is separate from judge cost.
+
+### Changed
+- Passing `prompt` without a version or label still attaches production. The next SDK release removes that default. `traccia-ts eval` requires `--prompt` with `--prompt-version` or `--prompt-label`.
+
+### Fixed
+- With `redactPii: true`, span events, exceptions, arrays, and nested values are redacted before export. A nested value inherits its parent key, so `{ result: { answer: ... } }` is redacted in the default mode. `redactAllStrings` is honored, and error status text is scrubbed.
+- Span logging runs after redaction, so `enableSpanLogging: true` does not print the original values.
+- OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages `create` calls are traced and governed. A stream stays open until it is consumed, closed, or errors, and `chat.completions.parse()` keeps `_request_id`. The published package does not bundle `openai` or `@anthropic-ai/sdk`, so the patch applies to the copy the application loads.
+- The default trace endpoint is `https://api.traccia.ai/v2/traces`.
+- `package.json` license is Apache-2.0, matching the LICENSE file.
+
 ## [0.1.18] - 2026-10-08
 
 ### Added

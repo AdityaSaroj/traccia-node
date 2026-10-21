@@ -14,7 +14,7 @@ import * as http from 'http';
 import { ISpan, ISpanExporter } from '../types';
 import { version as tracciaVersion } from '../../package.json';
 
-export const DEFAULT_ENDPOINT = 'https://api.dashboard.com/api/v1/traces';
+export const DEFAULT_ENDPOINT = 'https://api.traccia.ai/v2/traces';
 
 const TRANSIENT_STATUS_CODES = new Set([429, 503, 504]);
 

@@ -222,9 +222,28 @@ describe('eval/client', () => {
                         scorer_ids: [],
                         results: {},
                         aggregates: {},
+                        run_context: {},
                     },
                 }),
             );
+        });
+
+        it('retries a 5xx and returns the saved experiment', async () => {
+            mockAxiosRequest
+                .mockResolvedValueOnce({ status: 503, data: { detail: 'unavailable' } })
+                .mockResolvedValueOnce({ status: 200, data: { id: 'exp-1' } });
+
+            const result = await createExperiment({ datasetId: 'ds-1', experimentId: 'exp-1' });
+
+            expect(result).toEqual({ id: 'exp-1' });
+            expect(mockAxiosRequest).toHaveBeenCalledTimes(2);
+        });
+
+        it('does not retry a client error', async () => {
+            mockAxiosRequest.mockResolvedValue({ status: 422, data: { detail: 'no' } });
+
+            await expect(createExperiment({ datasetId: 'ds-1' })).rejects.toBeInstanceOf(EvaluateError);
+            expect(mockAxiosRequest).toHaveBeenCalledTimes(1);
         });
 
         it('sets body.id when experimentId is provided', async () => {

@@ -62,3 +62,48 @@ describe('RedactionSpanProcessor', () => {
         expect(() => processor.forceFlush()).not.toThrow();
     });
 });
+
+describe('RedactionSpanProcessor (TRC-291 coverage)', () => {
+    const { TracerProvider } = require('../tracer/provider');
+
+    function runSpan(options: ConstructorParameters<typeof RedactionSpanProcessor>[0], body: (span: ISpan) => void) {
+        const provider = new TracerProvider();
+        let seen: any;
+        provider.addSpanProcessor(new RedactionSpanProcessor(options));
+        provider.addSpanProcessor({
+            onEnd: (s: ISpan) => {
+                seen = JSON.parse(JSON.stringify({ a: s.attributes, e: s.events, d: s.statusDescription }));
+            },
+            shutdown() {},
+            forceFlush() {},
+        });
+        const span = provider.getTracer('t').startSpan('op');
+        body(span);
+        span.end();
+        return seen;
+    }
+
+    it('honors redactAllStrings for opaque keys and string arrays', () => {
+        const seen = runSpan({ redactAllStrings: true }, (span) => {
+            span.setAttribute('opaque', 'x@y.io');
+            span.setAttribute('llm.prompt', ['hi x@y.io', 'ok']);
+        });
+        expect(seen.a.opaque).toBe('[REDACTED_EMAIL]');
+        expect(seen.a['llm.prompt']).toEqual(['hi [REDACTED_EMAIL]', 'ok']);
+    });
+
+    it('redacts result attributes by default', () => {
+        const seen = runSpan(undefined, (span) => span.setAttribute('result', 'x@y.io'));
+        expect(seen.a.result).toBe('[REDACTED_EMAIL]');
+    });
+
+    it('redacts custom events, exceptions and status description', () => {
+        const seen = runSpan({ redactAllStrings: true }, (span) => {
+            span.addEvent('custom', { payload: 'x@y.io' });
+            span.recordException(new Error('bad x@y.io'));
+        });
+        expect(JSON.stringify(seen)).not.toContain('x@y.io');
+        expect(seen.e.map((e: any) => e.name)).toEqual(['custom', 'exception']);
+        expect(seen.d).toBe('bad [REDACTED_EMAIL]');
+    });
+});

@@ -120,6 +120,20 @@ console.log(result.url);
 
 See [Evaluate in the SDK](https://traccia.ai/docs/sdk/evaluate) and the walkthrough [Run Experiments From Code](https://traccia.ai/docs/guides/sdk-evaluate).
 
+### Run evals in CI
+
+`traccia-ts eval` runs a module that exports `task`, saves an experiment, and writes `summary.json`. Exit codes match the Python CLI: 0 pass, 1 quality miss, 2 bad command or baseline, 3 untrustworthy evidence, 4 the experiment did not save, 5 the summary file was not written. With no pass-rate bar, a green check is Execution Only: no pass-rate gate, while cost and latency gates can still apply. `--max-drop 0.05` is five percentage points. A function in the module is `export const scorers = { name }` and `--scorer local:name`. A local scorer cannot pass `--max-drop`. Pass `--prompt` with `--prompt-version` or `--prompt-label` when the experiment should record a prompt version. Platform LLM-judge and Jev scorers read `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` or `GOOGLE_API_KEY`, `GROQ_API_KEY`, and `TYPESAFE_API_KEY`, or a JSON object in `TRACCIA_PROVIDER_KEYS`. Each Jev question is gated on its own pass rate. Load `.ts` task files with `tsx`.
+
+```bash
+traccia-ts eval experiments/support_agent.mjs \
+  --output summary.json \
+  --dataset support-golden \
+  --scorer exact_match \
+  --min-pass-rate 0.9
+```
+
+See [Run Evals In CI](https://traccia.ai/docs/guides/ci-evals).
+
 ### Integration with LLMs (LangChain)
 
 Seamlessly integrate with LangChain to automatically track model usage, tokens, and latency.

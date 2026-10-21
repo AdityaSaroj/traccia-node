@@ -1,8 +1,15 @@
+import { createHash } from 'crypto';
+
 /**
  * Local ports of platform deterministic scorers.
  */
 
 export const BUILTIN_SCORERS = new Set(['exact_match', 'contains', 'json_valid']);
+
+export function builtinDefinitionHash(name: string): string {
+  const payload = `{"implementation_version":"1","type":"${name}"}`;
+  return `sha256:${createHash('sha256').update(payload).digest('hex')}`;
+}
 
 function normalizeText(value: unknown): string {
   if (value == null) return '';
@@ -18,7 +25,15 @@ function normalizeText(value: unknown): string {
 }
 
 function stamped(name: string, rec: Record<string, unknown>): Record<string, unknown> {
-  return { ...rec, name, scorer_name: name, type: name };
+  return {
+    status: 'judged',
+    definition_hash: builtinDefinitionHash(name),
+    definition_identity: 'builtin',
+    ...rec,
+    name,
+    scorer_name: name,
+    type: name,
+  };
 }
 
 export function runBuiltinScorer(

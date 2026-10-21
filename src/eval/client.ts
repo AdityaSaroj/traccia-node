@@ -47,11 +47,19 @@ export async function fetchDataset(nameOrId: string, opts?: { apiKey?: string; p
   return request('GET', `/api/v1/eval-runtime/datasets/${encodeURIComponent(nameOrId)}`, opts);
 }
 
-export async function fetchDatasetItems(
+export async function fetchDatasetItemsPayload(
   datasetId: string,
   opts?: { apiKey?: string; promptApiBase?: string },
 ) {
   const data = await request('GET', `/api/v1/eval-runtime/datasets/${datasetId}/items`, opts);
+  return (data || { items: [] }) as Record<string, unknown>;
+}
+
+export async function fetchDatasetItems(
+  datasetId: string,
+  opts?: { apiKey?: string; promptApiBase?: string },
+) {
+  const data = await fetchDatasetItemsPayload(datasetId, opts);
   return (data?.items || []) as Record<string, unknown>[];
 }
 
@@ -84,6 +92,7 @@ export async function scoreRemote(opts: {
   expectedOutput?: unknown;
   input?: unknown;
   providerKeys?: Record<string, string>;
+  scorerSnapshotToken?: string;
   apiKey?: string;
   promptApiBase?: string;
 }) {
@@ -97,8 +106,16 @@ export async function scoreRemote(opts: {
       expected_output: opts.expectedOutput,
       input: opts.input,
       provider_keys: opts.providerKeys || {},
+      ...(opts.scorerSnapshotToken ? { scorer_snapshot_token: opts.scorerSnapshotToken } : {}),
     },
   });
+}
+
+export async function fetchExperiment(
+  experimentId: string,
+  opts?: { apiKey?: string; promptApiBase?: string },
+) {
+  return request('GET', `/api/v1/eval-runtime/experiments/${experimentId}`, opts);
 }
 
 export async function createExperiment(opts: {
@@ -109,6 +126,8 @@ export async function createExperiment(opts: {
   scorerIds?: string[];
   results?: Record<string, unknown>;
   aggregates?: Record<string, unknown>;
+  runContext?: Record<string, unknown>;
+  datasetSnapshotToken?: string;
   apiKey?: string;
   promptApiBase?: string;
 }) {
@@ -119,18 +138,32 @@ export async function createExperiment(opts: {
     scorer_ids: opts.scorerIds || [],
     results: opts.results || {},
     aggregates: opts.aggregates || {},
+    run_context: opts.runContext || {},
   };
+  if (opts.datasetSnapshotToken) body.dataset_snapshot_token = opts.datasetSnapshotToken;
   if (opts.experimentId) body.id = opts.experimentId;
-  return request('POST', '/api/v1/eval-runtime/experiments', {
+  const call = () => request('POST', '/api/v1/eval-runtime/experiments', {
     apiKey: opts.apiKey,
     promptApiBase: opts.promptApiBase,
     body,
   });
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await call();
+    } catch (err) {
+      lastError = err;
+      const retry = err instanceof EvaluateError && String(err.message).startsWith('Eval runtime 5');
+      if (!retry || attempt === 2) throw err;
+      await new Promise((resolve) => setTimeout(resolve, 200 * (attempt + 1)));
+    }
+  }
+  throw lastError;
 }
 
 export async function resolvePromptVersionIds(
   promptName: string,
-  opts?: { apiKey?: string; promptApiBase?: string },
+  opts?: { apiKey?: string; promptApiBase?: string; version?: number | null; label?: string | null },
 ): Promise<string[]> {
   const { fetchPromptRuntime } = await import('../prompts/client');
   const { payload } = await fetchPromptRuntime(promptName, opts);

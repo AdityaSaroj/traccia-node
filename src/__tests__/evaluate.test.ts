@@ -3,7 +3,8 @@
  */
 
 import { runBuiltinScorer } from '../eval/builtins';
-import { evaluate } from '../eval/evaluate';
+import { evaluate, namedScorer } from '../eval/evaluate';
+import { reportFromRows } from '../eval/gate';
 import { EvaluateError } from '../eval/errors';
 
 // Mutable so individual tests can flip isTracingStarted() to exercise
@@ -16,6 +17,27 @@ let mockInit: jest.Mock = jest.fn(async () => undefined);
 // costFromSpan reading llm.cost.usd) - the mock has no real context
 // propagation, so this is the only way to exercise that read path.
 let mockItemSpanPresetAttributes: Record<string, unknown> = {};
+const mockSpanProcessors: Array<{ onEnd: (span: any) => void }> = [];
+const mockProvider = {
+  forceFlush: async () => undefined,
+  addSpanProcessor: (processor: { onEnd: (span: any) => void }) => {
+    if (!mockSpanProcessors.includes(processor)) mockSpanProcessors.push(processor);
+  },
+};
+const mockRuntimeState: {
+  provider: unknown;
+  started: boolean;
+  taskChildCosts?: unknown;
+  costProvider?: unknown;
+} = { provider: null, started: false };
+
+function resetMockRuntime(): void {
+  mockRuntimeState.provider = null;
+  mockRuntimeState.started = false;
+  mockRuntimeState.taskChildCosts = undefined;
+  mockRuntimeState.costProvider = undefined;
+  mockSpanProcessors.length = 0;
+}
 
 jest.mock('../auto', () => {
   return {
@@ -32,9 +54,8 @@ jest.mock('../auto', () => {
         return fn(span);
       },
     }),
-    getTracerProvider: () => ({
-      forceFlush: async () => undefined,
-    }),
+    getTracerProvider: () => mockProvider,
+    runtimeState: () => mockRuntimeState,
     init: (...args: unknown[]) => mockInit(...args),
     isTracingStarted: () => mockIsTracingStarted,
   };
@@ -43,6 +64,7 @@ jest.mock('../auto', () => {
 jest.mock('../eval/client', () => ({
   fetchDataset: jest.fn(),
   fetchDatasetItems: jest.fn(),
+  fetchDatasetItemsPayload: jest.fn(),
   createEphemeralDataset: jest.fn(),
   fetchScorer: jest.fn(),
   scoreRemote: jest.fn(),
@@ -58,12 +80,16 @@ beforeEach(() => {
   mockIsTracingStarted = true;
   mockInit = jest.fn(async () => undefined);
   mockItemSpanPresetAttributes = {};
+  resetMockRuntime();
   jest.clearAllMocks();
 });
 
 describe('runBuiltinScorer', () => {
   it('exact_match', () => {
-    expect(runBuiltinScorer('exact_match', { output: ' Hi ', expected: 'hi' }).passed).toBe(true);
+    expect(runBuiltinScorer('exact_match', { output: ' Hi ', expected: 'hi' })).toMatchObject({
+      passed: true,
+      status: 'judged',
+    });
     expect(runBuiltinScorer('exact_match', { output: 'a', expected: 'b' }).passed).toBe(false);
   });
 
@@ -312,7 +338,9 @@ describe('evaluate scorer variants', () => {
     });
 
     const score = (result.rows[0].panels as any[])[0].scores[0];
-    expect(score.passed).toBe(false);
+    expect(score.status).toBe('error');
+    expect(score.passed).toBeNull();
+    expect(score.score).toBeNull();
     expect(score.reason).toContain('scorer_error');
   });
 
@@ -365,7 +393,7 @@ describe('evaluate scorer variants', () => {
       progress: false,
     });
     const score = (result.rows[0].panels as any[])[0].scores[0];
-    expect(score).toMatchObject({ passed: false, reason: 'invalid_scorer_return' });
+    expect(score).toMatchObject({ status: 'error', passed: null, score: null, reason: 'invalid_scorer_return' });
   });
 
   it('resolves a non-builtin string scorer via evalClient.fetchScorer/scoreRemote', async () => {
@@ -458,7 +486,14 @@ describe('evaluate scorer variants', () => {
   });
 
   it('resolves a non-builtin string scorer whose platform type IS a builtin, running it locally', async () => {
-    mockEvalClient.fetchScorer.mockResolvedValue({ id: 'scorer-2', name: 'wraps-exact-match', type: 'exact_match' });
+    mockEvalClient.fetchScorer.mockResolvedValue({
+      id: 'scorer-2',
+      name: 'wraps-exact-match',
+      type: 'exact_match',
+      definition_hash: 'sha256:platform',
+      implementation_version: '1',
+      scorer_snapshot_token: 'token',
+    });
 
     const result = await evaluate({
       name: 'platform-builtin-scorer',
@@ -472,6 +507,52 @@ describe('evaluate scorer variants', () => {
     expect(mockEvalClient.scoreRemote).not.toHaveBeenCalled();
     const score = (result.rows[0].panels as any[])[0].scores[0];
     expect(score.passed).toBe(true);
+    expect(score.scorer_name).toBe('wraps-exact-match');
+    expect(score.scorer_id).toBe('scorer-2');
+    expect(score.definition_hash).toBe('sha256:platform');
+    expect(score.scorer_snapshot_token).toBe('token');
+    expect(score.definition_identity).toBeUndefined();
+  });
+
+  it('keeps the exported scorer key', async () => {
+    function scoreAccuracy() {
+      return { passed: true, score: 1 };
+    }
+    const result = await evaluate({
+      name: 'alias',
+      data: [{ input: { q: 'a' }, expected: 'a' }],
+      task: (inp) => inp.q,
+      scorers: [namedScorer(scoreAccuracy, 'accuracy')],
+      persist: false,
+      progress: false,
+    });
+    const score = (result.rows[0].panels as any[])[0].scores[0];
+    expect(score.name).toBe('accuracy');
+    const reported = reportFromRows(result.rows as any[], [], undefined, ['local:accuracy']);
+    expect(reported[0].name).toBe('accuracy');
+    expect(reported[0].missing).toBe(0);
+    expect(reported[0].completed).toBe(1);
+  });
+
+  it('derives a score from passed and keeps the spec name', async () => {
+    function scoreAccuracy() {
+      return { passed: true, name: 'not-the-key' };
+    }
+    const result = await evaluate({
+      name: 'alias',
+      data: [{ input: { q: 'a' }, expected: 'a' }],
+      task: (inp) => inp.q,
+      scorers: [namedScorer(scoreAccuracy, 'accuracy')],
+      persist: false,
+      progress: false,
+    });
+    const score = (result.rows[0].panels as any[])[0].scores[0];
+    expect(score.name).toBe('accuracy');
+    expect(score.scorer_name).toBe('accuracy');
+    expect(score.score).toBe(1);
+    const reported = reportFromRows(result.rows as any[], [], undefined, ['local:accuracy']);
+    expect(reported[0].completed).toBe(1);
+    expect(reported[0].errored).toBe(0);
   });
 });
 
@@ -489,7 +570,9 @@ describe('evaluate scorer errors surfaced at the span level', () => {
     });
 
     const score = (result.rows[0].panels as any[])[0].scores[0];
-    expect(score.passed).toBe(false);
+    expect(score.status).toBe('error');
+    expect(score.passed).toBeNull();
+    expect(score.score).toBeNull();
     expect(score.reason).toContain('scorer_error');
   });
 });
@@ -518,9 +601,11 @@ describe('evaluate platform-scorer pre-resolution', () => {
 describe('evaluate dataset-by-name and persist paths', () => {
   it('fetches a dataset by name/id when data is a string', async () => {
     mockEvalClient.fetchDataset.mockResolvedValue({ id: 'ds-1' });
-    mockEvalClient.fetchDatasetItems.mockResolvedValue([
-      { id: 'item-1', input: { q: 'hi' }, expected_output: 'hi' },
-    ]);
+    mockEvalClient.fetchDatasetItemsPayload.mockResolvedValue({
+      items: [{ id: 'item-1', input: { q: 'hi' }, expected_output: 'hi' }],
+      dataset_snapshot_token: 'token',
+      dataset_fingerprint: 'sha256:abc',
+    });
     mockEvalClient.createExperiment.mockResolvedValue({ id: 'exp-1', url: 'https://app.example/exp-1' });
 
     const result = await evaluate({
@@ -686,7 +771,7 @@ describe('ensureEvalTracing', () => {
 });
 
 describe('cost aggregation', () => {
-  it('sums per-score cost_usd into cell.cost_usd and aggregates.total_cost_usd', async () => {
+  it('keeps scorer cost off the task cost', async () => {
     const costlyScorer = () => ({ passed: true, type: 'llm_judge', model: 'gpt-4', cost_usd: 0.05 });
 
     const result = await evaluate({
@@ -698,8 +783,11 @@ describe('cost aggregation', () => {
       progress: false,
     });
 
-    expect((result.rows[0].panels as any[])[0].cost_usd).toBeCloseTo(0.05);
-    expect(result.aggregates.total_cost_usd).toBeCloseTo(0.05);
+    const panel = (result.rows[0].panels as any[])[0];
+    expect(panel.cost_usd).toBeUndefined();
+    expect(panel.task_cost.coverage).toBe('unknown');
+    expect(panel.scores[0].cost_usd).toBeCloseTo(0.05);
+    expect(result.aggregates.total_cost_usd).toBeUndefined();
   });
 
   it('includes cost already recorded on the per-item span (costFromSpan) even with no scorer cost', async () => {
@@ -714,6 +802,29 @@ describe('cost aggregation', () => {
     });
 
     expect((result.rows[0].panels as any[])[0].cost_usd).toBeCloseTo(0.02);
+  });
+
+  it('adds a provider child span cost recorded on the SDK provider', async () => {
+    const result = await evaluate({
+      name: 'cost-from-child',
+      data: [{ input: { q: 'hi' } }],
+      task: () => {
+        for (const processor of mockSpanProcessors) {
+          processor.onEnd({
+            name: 'chat.completions',
+            attributes: { 'llm.model': 'gpt-4o-mini', 'llm.cost.usd': 0.25 },
+          });
+        }
+        return 'x';
+      },
+      persist: false,
+      progress: false,
+    });
+
+    const panel = (result.rows[0].panels as any[])[0];
+    expect(panel.task_cost.coverage).toBe('complete');
+    expect(panel.task_cost.usd).toBeCloseTo(0.25);
+    expect(panel.cost_usd).toBeCloseTo(0.25);
   });
 
   it('sets llm_judge span attributes including usage token totals', async () => {

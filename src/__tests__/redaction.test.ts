@@ -194,3 +194,15 @@ describe('DEFAULT_SENSITIVE_KEY_FRAGMENTS', () => {
     expect(DEFAULT_SENSITIVE_KEY_FRAGMENTS.has('message')).toBe(true);
   });
 });
+describe('nested sensitivity (TRC-291 review)', () => {
+    const { redactAttributes } = require('../redaction/redaction');
+
+    it('nested values inherit their parent key sensitivity in default mode', () => {
+        const out = redactAttributes({
+            result: { answer: 'x@y.io', items: [{ v: 'x@y.io' }] },
+            opaque: { v: 'x@y.io' },
+        });
+        expect(JSON.stringify(out.result)).not.toContain('x@y.io');
+        expect(out.opaque).toEqual({ v: 'x@y.io' });
+    });
+});

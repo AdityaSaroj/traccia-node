@@ -1,5 +1,3 @@
-#!/usr/bin/env node
-
 import { Command } from 'commander';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -12,6 +10,7 @@ import {
 } from './config/config';
 
 const program = new Command();
+program.exitOverride();
 
 program
   .name('traccia-ts')
@@ -431,4 +430,332 @@ program
     }
   });
 
-program.parse(process.argv);
+const realProcessExit = process.exit.bind(process);
+
+async function withScriptExits<T>(fn: () => Promise<T>): Promise<T> {
+  const previous = process.exit;
+  process.exit = ((code?: number) => {
+    const error = new Error(
+      code ? `The task script exited with status ${code}` : 'The task script exited before the run finished',
+    );
+    (error as Error & { tracciaExit?: number }).tracciaExit = code ?? 0;
+    throw error;
+  }) as typeof process.exit;
+  try {
+    return await fn();
+  } finally {
+    process.exit = previous;
+  }
+}
+
+function scriptHalted(err: { tracciaExit?: number; message?: string }, output: string, writeSummary: Function) {
+  const message = err.tracciaExit
+    ? `The task script exited with status ${err.tracciaExit}`
+    : 'The task script exited before the run finished';
+  evalFailure(output, 3, 'task_error', message, writeSummary);
+}
+
+function evalFailure(output: string, code: number, name: string, message: string, writeSummary: Function) {
+  const body = {
+    exit_code: code,
+    code: name,
+    failures: [{ code: name, message }],
+    quality_gate: false,
+    label: 'Failed',
+  };
+  if (!writeSummary(output, body)) process.exit(5);
+  console.error(message);
+  process.exit(code);
+}
+
+async function resolveScorerIds(scorers: string[]) {
+  const { BUILTIN_SCORERS } = await import('./eval/builtins');
+  const { fetchScorer } = await import('./eval/client');
+  const found: Record<string, string> = {};
+  for (const name of scorers || []) {
+    const text = String(name);
+    if (text.startsWith('local:') || BUILTIN_SCORERS.has(text)) continue;
+    try {
+      const remote = await fetchScorer(text);
+      if (remote?.id) found[text] = String(remote.id);
+    } catch {
+      // A missing scorer stays unresolved. The baseline check reports it.
+    }
+  }
+  return found;
+}
+
+async function loadBaseline(options: any) {
+  const { fetchExperiment } = await import('./eval/client');
+  const { fetchPromptRuntime } = await import('./prompts/client');
+  let experimentId = options.baselineExperiment;
+  let panelIndex = options.baselinePanel;
+  let promptVersionId: string | null = null;
+  if (options.baselinePrompt) {
+    try {
+      const { payload } = await fetchPromptRuntime(options.baselinePrompt, { label: 'production' });
+      experimentId = payload.evidence_experiment_id;
+      if (!experimentId) return { missing: true };
+      if (panelIndex == null && payload.evidence_panel_index != null) panelIndex = payload.evidence_panel_index;
+      promptVersionId = payload.evidence_prompt_version_id ? String(payload.evidence_prompt_version_id) : null;
+    } catch {
+      return { missing: true };
+    }
+  }
+  let experiment: any;
+  try {
+    experiment = await fetchExperiment(String(experimentId));
+  } catch {
+    return { missing: true };
+  }
+  const context = experiment.run_context || {};
+  const panels = experiment.aggregates?.panels || [];
+  if (panelIndex != null && Number(panelIndex) < 0) return { panel_required: true };
+  if (panels.length > 1 && panelIndex == null) return { panel_required: true };
+  if (panelIndex == null) panelIndex = panels.length ? Number(panels[0].panel_index || 0) : 0;
+  const panel = panels.find((item: any) => Number(item.panel_index || 0) === Number(panelIndex));
+  if (panels.length && !panel) return { missing: true };
+  let measured: any = null;
+  for (const item of context.panel_measurements || []) {
+    if (item && Number(item.panel_index || 0) === Number(panelIndex)) {
+      measured = item;
+      break;
+    }
+  }
+  if (!measured && Number(panelIndex) === 0 && !('panel_measurements' in context)) measured = context;
+  measured = measured || {};
+  return {
+    experiment_id: String(experiment.id || experimentId),
+    panel_index: Number(panelIndex),
+    prompt_version_id: panel?.prompt_version_id || promptVersionId,
+    dataset_fingerprint: context.dataset_fingerprint,
+    dataset_verified: context.dataset_verified === true,
+    scorer_evidence: context.scorer_evidence || [],
+    scorers: panel?.scorers || [],
+    latency_concurrency: context.latency_concurrency,
+    mean_latency_ms: measured.mean_latency_ms,
+    task_cost_usd: measured.task_cost_usd,
+    task_cost_coverage: measured.task_cost_coverage,
+    judge_cost_usd: measured.judge_cost_usd,
+    judge_cost_coverage: measured.judge_cost_coverage,
+    judge_definition_hashes: measured.judge_definition_hashes || [],
+  };
+}
+
+program
+  .command('eval')
+  .description('Run an experiment and fail the process when a gate misses')
+  .argument('<script>', 'Module that exports task')
+  .requiredOption('--output <path>', 'Summary JSON path')
+  .requiredOption('--dataset <name>', 'Dataset name or id')
+  .option('--name <name>', 'Experiment title. Defaults to the script or dataset name followed by eval.')
+  .option('--scorer <name...>', 'Scorer names')
+  .option('--informational <name...>', 'Selected scorers that skip the pass-rate bar')
+  .option('--min-pass-rate <rate>', 'Absolute pass rate', (value) => Number(value))
+  .option('--max-drop <points>', 'Allowed drop in percentage points', (value) => Number(value))
+  .option('--baseline-prompt <name>')
+  .option('--baseline-experiment <id>')
+  .option('--baseline-panel <index>', 'Baseline panel', (value) => Number(value))
+  .option('--allow-dataset-change')
+  .option('--allow-concurrency-mismatch')
+  .option('--max-latency-increase <ratio>', 'Allowed latency increase', (value) => Number(value))
+  .option('--max-task-cost-increase <ratio>', 'Allowed task cost increase', (value) => Number(value))
+  .option('--max-judge-cost-increase <ratio>', 'Allowed judge cost increase', (value) => Number(value))
+  .option('--prompt <name>', 'Prompt name to attach as promotion evidence')
+  .option('--prompt-version <version>', 'Prompt version number', (value) => Number(value))
+  .option('--prompt-label <label>', 'Prompt label, such as production')
+  .action(async (script, options) => {
+    const { applyBaseline, decide, preflight, reportFromRows, validateBaseline, writeSummary } = await import('./eval/gate');
+    const gateOptions: {
+      scorers: string[];
+      informational: string[];
+      min_pass_rate: number | undefined;
+      max_drop: number | undefined;
+      baseline_prompt: string | undefined;
+      baseline_experiment: string | undefined;
+      max_latency_increase: number | undefined;
+      max_task_cost_increase: number | undefined;
+      max_judge_cost_increase: number | undefined;
+      unhashed_scorers: string[];
+      scorer_ids: Record<string, string>;
+    } = {
+      scorers: options.scorer || [],
+      informational: options.informational || [],
+      min_pass_rate: options.minPassRate,
+      max_drop: options.maxDrop,
+      baseline_prompt: options.baselinePrompt,
+      baseline_experiment: options.baselineExperiment,
+      max_latency_increase: options.maxLatencyIncrease,
+      max_task_cost_increase: options.maxTaskCostIncrease,
+      max_judge_cost_increase: options.maxJudgeCostIncrease,
+      unhashed_scorers: (options.scorer || [])
+        .filter((name: string) => String(name).startsWith('local:'))
+        .map((name: string) => String(name).slice('local:'.length)),
+      scorer_ids: {},
+    };
+    const early = preflight(gateOptions);
+    if (early) {
+      if (!writeSummary(options.output, { ...early, label: 'Failed' })) process.exit(5);
+      console.error(early.failures[0].message);
+      process.exit(early.exit_code);
+    }
+    let baseline: any = null;
+    if (options.baselinePrompt || options.baselineExperiment) {
+      baseline = await loadBaseline(options);
+      if (options.maxDrop != null) {
+        gateOptions.scorer_ids = await resolveScorerIds(options.scorer || []);
+      }
+      const blocked = validateBaseline(baseline, gateOptions);
+      if (blocked) {
+        if (!writeSummary(options.output, { ...blocked, label: 'Failed' })) process.exit(5);
+        console.error(blocked.failures[0].message);
+        process.exit(blocked.exit_code);
+      }
+    }
+    const onSigint = () => {
+      process.exit = realProcessExit;
+      evalFailure(options.output, 130, 'task_error', 'The eval was interrupted', writeSummary);
+    };
+    process.on('SIGINT', onSigint);
+    let loaded: any;
+    try {
+      loaded = await withScriptExits(() => import(path.resolve(script)));
+    } catch (err: any) {
+      if (err?.tracciaExit != null) scriptHalted(err, options.output, writeSummary);
+      evalFailure(options.output, 2, 'bad_flags', `Could not load the task script: ${err?.message || err}`, writeSummary);
+    }
+    const local = loaded.scorers || {};
+    const { namedScorer } = await import('./eval/evaluate');
+    const scorers = [];
+    for (const name of options.scorer || []) {
+      if (String(name).startsWith('local:')) {
+        const key = String(name).slice('local:'.length);
+        if (!local[key]) evalFailure(options.output, 2, 'unknown_scorer', `Unknown local scorer ${key}`, writeSummary);
+        scorers.push(namedScorer(local[key], key));
+      } else {
+        scorers.push(name);
+      }
+    }
+    if ((options.promptVersion != null || options.promptLabel) && !options.prompt) {
+      evalFailure(options.output, 2, 'bad_flags', 'A prompt version needs a prompt name', writeSummary);
+    }
+    if (options.prompt && options.promptVersion == null && !String(options.promptLabel || '').trim()) {
+      evalFailure(options.output, 2, 'bad_flags', 'Pass a prompt version or label', writeSummary);
+    }
+    const { experimentName } = await import('./eval/experimentName');
+    const { evaluate } = await import('./eval/evaluate');
+    const { EvaluateError } = await import('./eval/errors');
+    const { providerKeysFromEnv } = await import('./eval/providerKeys');
+    let providerKeys: Record<string, string> = {};
+    try {
+      providerKeys = providerKeysFromEnv();
+    } catch (err: any) {
+      evalFailure(options.output, 2, 'bad_flags', String(err?.message || err), writeSummary);
+    }
+    let result: any;
+    try {
+      result = await withScriptExits(() => evaluate({
+        name: experimentName({ name: options.name, dataset: options.dataset, script }),
+        data: options.dataset,
+        task: loaded.task,
+        scorers,
+        prompt: options.prompt,
+        promptVersion: options.promptVersion,
+        promptLabel: options.promptLabel,
+        providerKeys,
+        persist: true,
+        progress: true,
+        runContext: {
+          checkout_sha: process.env.TRACCIA_GIT_CHECKOUT_SHA,
+          github_sha: process.env.TRACCIA_GIT_GITHUB_SHA,
+          head_sha: process.env.TRACCIA_GIT_HEAD_SHA,
+          head_ref: process.env.TRACCIA_GIT_HEAD_REF,
+          base_ref: process.env.TRACCIA_GIT_BASE_REF,
+          pr: process.env.TRACCIA_PR_NUMBER,
+          repository: process.env.TRACCIA_GIT_REPOSITORY,
+          actor: process.env.TRACCIA_GIT_ACTOR,
+          ...(baseline
+            ? {
+                baseline_experiment_id: baseline.experiment_id,
+                baseline_panel_index: baseline.panel_index,
+                baseline_prompt_version_id: baseline.prompt_version_id,
+              }
+            : {}),
+        },
+      }));
+    } catch (err: any) {
+      if (err?.tracciaExit != null) scriptHalted(err, options.output, writeSummary);
+      if (err instanceof EvaluateError) {
+        evalFailure(options.output, 2, 'bad_flags', String(err.message || err), writeSummary);
+      }
+      evalFailure(options.output, 3, 'task_error', String(err?.message || err), writeSummary);
+    }
+    const stored = result.runContext || {};
+    const report: Record<string, any> = {
+      rows: result.rows,
+      persist_error: result.persistError,
+      dataset_drift: Boolean(stored.dataset_drift),
+      dataset_verified: stored.dataset_verified,
+      dataset_fingerprint: stored.dataset_fingerprint,
+      experiment_id: result.experimentId,
+      url: result.url,
+      latency_concurrency: stored.latency_concurrency,
+      task_errors: result.errors?.length ? 1 : 0,
+      scorers: reportFromRows(
+        result.rows || [],
+        options.informational || [],
+        (result.rows || []).map((row: any) => row.item_id),
+        options.scorer || [],
+      ),
+      min_pass_rate: options.minPassRate,
+      max_drop: options.maxDrop,
+      allow_dataset_change: Boolean(options.allowDatasetChange),
+      allow_concurrency_mismatch: Boolean(options.allowConcurrencyMismatch),
+      max_latency_increase: options.maxLatencyIncrease,
+      max_task_cost_increase: options.maxTaskCostIncrease,
+      max_judge_cost_increase: options.maxJudgeCostIncrease,
+      baseline_experiment_id: baseline?.experiment_id,
+    };
+    applyBaseline(report, baseline);
+    const outcome = decide(report);
+    if (!writeSummary(options.output, outcome)) process.exit(5);
+    console.error(outcome.label || outcome.code);
+    process.exit(outcome.exit_code);
+  });
+
+function outputFlag(argv: string[]): string | undefined {
+  const index = argv.indexOf('--output');
+  if (index >= 0 && argv[index + 1] && !argv[index + 1].startsWith('-')) return argv[index + 1];
+  return undefined;
+}
+
+async function runCli(): Promise<void> {
+  try {
+    await program.parseAsync(process.argv);
+  } catch (err: any) {
+    if (err?.exitCode === 0 || err?.code === 'commander.helpDisplayed' || err?.code === 'commander.help') {
+      process.exit(0);
+    }
+    const usage = typeof err?.code === 'string' && err.code.startsWith('commander.');
+    const message = String(err?.message || err);
+    const auth = /API key/i.test(message);
+    const code = usage || auth ? 2 : 3;
+    const name = code === 2 ? 'bad_flags' : 'task_error';
+    const output = outputFlag(process.argv);
+    if (output) {
+      const { writeSummary } = await import('./eval/gate');
+      const body = {
+        exit_code: code,
+        code: name,
+        failures: [{ code: name, message }],
+        quality_gate: false,
+        label: 'Failed',
+      };
+      if (!writeSummary(output, body)) process.exit(5);
+    }
+    if (!usage) console.error(message);
+    process.exit(code);
+  }
+}
+
+void runCli();

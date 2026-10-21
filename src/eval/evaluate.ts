@@ -2,8 +2,9 @@
  * evaluate() runner — Braintrust/Langfuse-style offline experiments.
  */
 
+import { AsyncLocalStorage } from 'async_hooks';
 import { randomUUID } from 'crypto';
-import { getTracer, getTracerProvider, init, isTracingStarted } from '../auto';
+import { getTracer, getTracerProvider, init, isTracingStarted, runtimeState } from '../auto';
 import { BUILTIN_SCORERS, runBuiltinScorer } from './builtins';
 import * as evalClient from './client';
 import { EvaluateError } from './errors';
@@ -55,6 +56,9 @@ export type EvaluateOptions = {
   apiKey?: string;
   promptApiBase?: string;
   progress?: boolean;
+  promptVersion?: number | null;
+  promptLabel?: string | null;
+  runContext?: Record<string, unknown>;
   onItemComplete?: (done: number, total: number, row: Record<string, unknown>) => void;
 };
 
@@ -66,6 +70,7 @@ export class EvaluateResult {
   datasetId?: string | null;
   url?: string | null;
   persistError?: string | null;
+  runContext: Record<string, unknown>;
   errors: Array<{ item_id: string; error: string }>;
 
   constructor(init: {
@@ -76,6 +81,7 @@ export class EvaluateResult {
     datasetId?: string | null;
     url?: string | null;
     persistError?: string | null;
+    runContext?: Record<string, unknown>;
     errors?: Array<{ item_id: string; error: string }>;
   }) {
     this.name = init.name;
@@ -85,6 +91,7 @@ export class EvaluateResult {
     this.datasetId = init.datasetId ?? null;
     this.url = init.url ?? null;
     this.persistError = init.persistError ?? null;
+    this.runContext = init.runContext || {};
     this.errors = init.errors || [];
   }
 
@@ -101,6 +108,17 @@ export class EvaluateResult {
     else if (this.persistError) lines.push(`Persist error: ${this.persistError}`);
     else if (!this.experimentId) lines.push('Persisted: no (local-only)');
     return lines.join('\n');
+  }
+}
+
+function snapshotNeedsRefresh(token: unknown, margin = 300): boolean {
+  if (typeof token !== 'string' || !token.includes('.')) return false;
+  try {
+    const payload = JSON.parse(token.slice(0, token.lastIndexOf('.')));
+    const exp = payload && typeof payload.exp === 'number' ? payload.exp : null;
+    return exp != null && exp <= Date.now() / 1000 + margin;
+  } catch {
+    return false;
   }
 }
 
@@ -122,20 +140,30 @@ function normalizeInlineRows(data: Array<Record<string, unknown>>) {
 function normalizeScore(raw: unknown, defaultName: string): Record<string, unknown> {
   if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
     const out = { ...(raw as Record<string, unknown>) };
-    out.name = out.name || out.scorer_name || defaultName;
+    out.name = defaultName;
+    out.scorer_name = defaultName;
+    if (out.score == null && typeof out.passed === 'boolean') {
+      out.score = out.passed ? 1 : 0;
+    }
     if (out.passed == null && typeof out.score === 'number') {
       out.passed = out.score >= 0.5;
     }
-    if (out.passed == null) out.passed = false;
+    if (out.passed == null) {
+      return { name: defaultName, status: 'error', passed: null, score: null, reason: 'invalid_scorer_return' };
+    }
+    out.status = out.status || 'judged';
     return out;
   }
   if (typeof raw === 'number') {
-    return { name: defaultName, score: raw, passed: raw >= 0.5 };
+    if (!Number.isFinite(raw)) {
+      return { name: defaultName, status: 'error', passed: null, score: null, reason: 'non_finite_score' };
+    }
+    return { name: defaultName, status: 'judged', score: raw, passed: raw >= 0.5 };
   }
   if (typeof raw === 'boolean') {
-    return { name: defaultName, score: raw ? 1 : 0, passed: raw };
+    return { name: defaultName, status: 'judged', score: raw ? 1 : 0, passed: raw };
   }
-  return { name: defaultName, passed: false, reason: 'invalid_scorer_return', score: 0 };
+  return { name: defaultName, status: 'error', passed: null, reason: 'invalid_scorer_return', score: null };
 }
 
 function jsonable(value: unknown): unknown {
@@ -223,15 +251,83 @@ function annotateScoreSpan(span: any, scored: Record<string, unknown>): void {
   }
 }
 
-function costFromSpan(span: any): number | undefined {
-  const attrs = span?.attributes || {};
+function readCost(attrs: Record<string, unknown> | undefined): number | undefined {
   for (const key of ['llm.cost.usd', 'platform_cost_usd', 'traccia.cost.usd']) {
-    const raw = attrs[key];
+    const raw = attrs?.[key];
     if (raw == null) continue;
     const n = Number(raw);
     if (Number.isFinite(n)) return n;
   }
   return undefined;
+}
+
+function providerSpan(span: { name?: string; attributes?: Record<string, unknown> }): boolean {
+  const attrs = span?.attributes || {};
+  if (attrs['llm.model'] || attrs['gen_ai.request.model']) return true;
+  const name = String(span?.name || '');
+  return name !== 'evaluate.item' && !name.startsWith('scorer.') && name.includes('llm');
+}
+
+function taskChildCosts(): AsyncLocalStorage<Array<{ cost: number | null }>> {
+  const state = runtimeState();
+  if (!state.taskChildCosts) {
+    state.taskChildCosts = new AsyncLocalStorage();
+  }
+  return state.taskChildCosts;
+}
+
+function ensureChildCostProcessor(): void {
+  const state = runtimeState();
+  let provider;
+  try {
+    provider = getTracerProvider();
+  } catch {
+    return;
+  }
+  if (state.costProvider === provider) return;
+  state.costProvider = provider;
+  try {
+    provider.addSpanProcessor({
+      onEnd(span) {
+        const bucket = taskChildCosts().getStore();
+        if (!bucket) return;
+        const name = String(span?.name || '');
+        if (name === 'evaluate.item' || name.startsWith('scorer.')) return;
+        if (!providerSpan(span)) return;
+        const cost = readCost(span?.attributes as Record<string, unknown> | undefined);
+        bucket.push({ cost: cost == null ? null : cost });
+      },
+      forceFlush() {
+        return undefined;
+      },
+      shutdown() {
+        return undefined;
+      },
+    });
+  } catch {
+    state.costProvider = null;
+  }
+}
+
+function costFromSpan(span: any, childCosts?: Array<{ cost: number | null }>): number | undefined {
+  const own = readCost(span?.attributes);
+  if (own != null) return own;
+  const nested = [...(childCosts || [])];
+  for (const child of span?.children || []) {
+    if (providerSpan(child)) {
+      const cost = costFromSpan(child);
+      nested.push({ cost: cost == null ? null : cost });
+    }
+  }
+  if (!nested.length) return undefined;
+  if (nested.some((item) => item.cost == null)) return undefined;
+  return nested.reduce((sum, item) => sum + Number(item.cost), 0);
+}
+
+export function namedScorer(fn: (input: any) => unknown, key: string) {
+  const wrapped = (input: any) => fn(input);
+  Object.defineProperty(wrapped, 'name', { value: key, configurable: true });
+  return wrapped;
 }
 
 export async function evaluate(opts: EvaluateOptions): Promise<EvaluateResult> {
@@ -247,6 +343,15 @@ export async function evaluate(opts: EvaluateOptions): Promise<EvaluateResult> {
   const tracingOk = await ensureEvalTracing(cred);
 
   let datasetId: string | undefined;
+  let datasetSnapshotToken: string | undefined;
+  let datasetFingerprint: string | undefined;
+  let promptAttachment: string | undefined;
+  if (opts.prompt && opts.promptVersion == null && !opts.promptLabel) {
+    promptAttachment = 'deprecated_production_default';
+    process.stderr.write(
+      'warning: prompt without promptVersion or promptLabel still attaches production. The next SDK release removes that default.\n',
+    );
+  }
   let items: Array<{
     id: string;
     input: Record<string, unknown>;
@@ -257,7 +362,10 @@ export async function evaluate(opts: EvaluateOptions): Promise<EvaluateResult> {
   if (typeof opts.data === 'string') {
     const ds = await evalClient.fetchDataset(opts.data.trim(), cred);
     datasetId = String(ds.id);
-    const rawItems = await evalClient.fetchDatasetItems(datasetId, cred);
+    const rawPayload = await evalClient.fetchDatasetItemsPayload(datasetId, cred);
+    datasetSnapshotToken = rawPayload.dataset_snapshot_token ? String(rawPayload.dataset_snapshot_token) : undefined;
+    datasetFingerprint = rawPayload.dataset_fingerprint ? String(rawPayload.dataset_fingerprint) : undefined;
+    const rawItems = (rawPayload.items || []) as Record<string, unknown>[];
     items = rawItems.map((it) => ({
       id: String(it.id),
       input: (it.input as Record<string, unknown>) || {},
@@ -294,7 +402,11 @@ export async function evaluate(opts: EvaluateOptions): Promise<EvaluateResult> {
   const experimentId = persist ? randomUUID() : undefined;
   let promptVersionIds: string[] = [];
   if (persist && opts.prompt) {
-    promptVersionIds = await evalClient.resolvePromptVersionIds(opts.prompt, cred);
+    promptVersionIds = await evalClient.resolvePromptVersionIds(opts.prompt, {
+      ...cred,
+      version: opts.promptVersion,
+      label: opts.promptLabel,
+    });
   }
 
   const scorerCache = new Map<string, Record<string, unknown>>();
@@ -330,9 +442,20 @@ export async function evaluate(opts: EvaluateOptions): Promise<EvaluateResult> {
           expected: row.expected_output,
           metadata: row.metadata,
         });
-        return normalizeScore(raw, nm);
+        const scored = normalizeScore(raw, nm);
+        if (!scored.definition_hash && !scored.definition_identity) {
+          scored.definition_identity = 'source_fallback';
+        }
+        return scored;
       } catch (err: any) {
-        return { name: nm, passed: false, reason: `scorer_error: ${err?.message || err}`, score: 0 };
+        return {
+          name: nm,
+          status: 'error',
+          passed: null,
+          score: null,
+          reason: `scorer_error: ${err?.message || err}`,
+          definition_identity: 'source_fallback',
+        };
       }
     }
     const nm = String(spec).trim();
@@ -344,6 +467,10 @@ export async function evaluate(opts: EvaluateOptions): Promise<EvaluateResult> {
       scorer = await evalClient.fetchScorer(nm, cred);
       scorerCache.set(nm, scorer);
     }
+    if (snapshotNeedsRefresh(scorer.scorer_snapshot_token)) {
+      scorer = await evalClient.fetchScorer(nm, cred);
+      scorerCache.set(nm, scorer);
+    }
     const stype = String(scorer.type || '');
     if (BUILTIN_SCORERS.has(stype)) {
       const scored = runBuiltinScorer(stype, {
@@ -351,13 +478,22 @@ export async function evaluate(opts: EvaluateOptions): Promise<EvaluateResult> {
         expected: row.expected_output,
         config: (scorer.config as Record<string, unknown>) || {},
       });
-      return {
+      const platformName = String(scorer.name || nm);
+      const stamped: Record<string, unknown> = {
         ...scored,
         scorer_id: String(scorer.id || ''),
-        scorer_name: String(scorer.name || nm),
+        scorer_name: platformName,
+        name: platformName,
         type: stype,
         config: scorer.config || {},
+        definition_hash: scorer.definition_hash || scored.definition_hash,
+        implementation_version: scorer.implementation_version || scored.implementation_version,
       };
+      if (scorer.scorer_snapshot_token) {
+        stamped.scorer_snapshot_token = String(scorer.scorer_snapshot_token);
+        delete stamped.definition_identity;
+      }
+      return stamped;
     }
     const remote = await evalClient.scoreRemote({
       scorerId: String(scorer.id),
@@ -365,26 +501,33 @@ export async function evaluate(opts: EvaluateOptions): Promise<EvaluateResult> {
       expectedOutput: row.expected_output,
       input: row.input,
       providerKeys: opts.providerKeys,
+      scorerSnapshotToken: scorer.scorer_snapshot_token ? String(scorer.scorer_snapshot_token) : undefined,
       ...cred,
     });
+    const status = remote.status === 'error' ? 'error' : remote.status || (remote.score != null && typeof remote.passed === 'boolean' ? 'judged' : 'error');
     return {
       scorer_id: String(remote.scorer_id || scorer.id || ''),
       scorer_name: String(remote.scorer_name || scorer.name || nm),
       type: remote.type || stype,
       config: remote.config || scorer.config || {},
       name: String(remote.scorer_name || nm),
-      passed: Boolean(remote.passed),
+      status,
+      passed: status === 'error' ? null : remote.passed,
       reason: remote.reason,
-      score: remote.score,
+      score: status === 'error' ? null : remote.score,
       model: remote.model,
       latency_ms: remote.latency_ms,
-      cost_usd: remote.cost_usd,
       usage: remote.usage && typeof remote.usage === 'object' ? remote.usage : undefined,
+      definition_hash: remote.definition_hash || scorer.definition_hash,
+      implementation_version: remote.implementation_version || scorer.implementation_version,
+      scorer_snapshot_token: remote.scorer_snapshot_token || scorer.scorer_snapshot_token,
+      ...(remote.invocation && typeof remote.invocation === 'object' ? { invocation: remote.invocation } : {}),
       ...(Array.isArray(remote.questions) ? { questions: remote.questions } : {}),
       ...("unsure" in remote ? { unsure: remote.unsure } : {}),
     };
   };
 
+  ensureChildCostProcessor();
   await runPool(items, maxConcurrency, async (row, idx) => {
     const cell: Record<string, unknown> = {
       panel_index: 0,
@@ -409,7 +552,8 @@ export async function evaluate(opts: EvaluateOptions): Promise<EvaluateResult> {
       async (span) => {
       try {
         const t0 = Date.now();
-        const output = jsonable(await opts.task(row.input));
+        const childCosts: Array<{ cost: number | null }> = [];
+        const output = jsonable(await taskChildCosts().run(childCosts, () => opts.task(row.input)));
         cell.latency_ms = Date.now() - t0;
         cell.output = output;
         cell.error = null;
@@ -427,9 +571,10 @@ export async function evaluate(opts: EvaluateOptions): Promise<EvaluateResult> {
                 const fail: Record<string, unknown> = {
                   name: specNm,
                   scorer_name: specNm,
-                  passed: false,
+                  status: 'error',
+                  passed: null,
                   reason: `scorer_error: ${err?.message || err}`,
-                  score: 0,
+                  score: null,
                 };
                 if (BUILTIN_SCORERS.has(specNm)) fail.type = specNm;
                 annotateScoreSpan(scoreSpan, fail);
@@ -447,18 +592,11 @@ export async function evaluate(opts: EvaluateOptions): Promise<EvaluateResult> {
         }
         cell.scores = scores;
         cell.passed = scorers.length ? scores.every((s) => Boolean(s.passed)) : null;
-        let scoreCost = 0;
-        let scoreCostKnown = false;
-        for (const s of scores) {
-          if (s.cost_usd != null && Number.isFinite(Number(s.cost_usd))) {
-            scoreCost += Number(s.cost_usd);
-            scoreCostKnown = true;
-          }
-        }
-        const spanCost = costFromSpan(span);
-        if (spanCost != null || scoreCostKnown) {
-          cell.cost_usd = (spanCost || 0) + scoreCost;
-        }
+        const spanCost = costFromSpan(span, childCosts);
+        cell.task_cost = spanCost == null
+          ? { usd: null, coverage: 'unknown', basis: 'instrumented_spans' }
+          : { usd: spanCost, coverage: 'complete', basis: 'instrumented_spans' };
+        if (spanCost != null) cell.cost_usd = spanCost;
         try {
           span.setAttribute('traccia.eval.passed', Boolean(cell.passed));
           if (cell.latency_ms != null) {
@@ -545,6 +683,13 @@ export async function evaluate(opts: EvaluateOptions): Promise<EvaluateResult> {
     aggregates.total_cost_usd = costVals.reduce((a, b) => a + b, 0);
   }
 
+  const runContext: Record<string, unknown> = {
+    ...(opts.runContext || {}),
+    ...(datasetFingerprint ? { dataset_fingerprint: datasetFingerprint } : {}),
+    ...(promptAttachment ? { prompt_attachment: promptAttachment } : {}),
+    latency_concurrency: maxConcurrency,
+    latency_semantics: 'task_wall_per_item',
+  };
   const result = new EvaluateResult({
     name,
     rows,
@@ -552,6 +697,7 @@ export async function evaluate(opts: EvaluateOptions): Promise<EvaluateResult> {
     experimentId,
     datasetId,
     errors,
+    runContext,
   });
 
   if (persist) {
@@ -568,10 +714,13 @@ export async function evaluate(opts: EvaluateOptions): Promise<EvaluateResult> {
         scorerIds: platformScorerIds,
         results: { rows },
         aggregates,
+        runContext,
+        datasetSnapshotToken,
         ...cred,
       });
       result.url = created.url || null;
       result.experimentId = String(created.id || experimentId);
+      result.runContext = created.run_context || runContext;
     } catch (err: any) {
       result.persistError = String(err?.message || err);
     }
